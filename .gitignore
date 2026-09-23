@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.idea/
+.vscode/
+# данные и результаты обработки
+*.sl2
+*.sl3
+*.nmea
+*.pos
+*_out/
+truth.json
