@@ -14,8 +14,9 @@ import urllib.request
 from datetime import datetime, timedelta
 
 import numpy as np
+from scipy.ndimage import median_filter
 from PySide6.QtCore import QRect, QSettings, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QImage, QPainter, QPixmap
+from PySide6.QtGui import QColor, QDesktopServices, QIcon, QImage, QPainter, QPixmap
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
@@ -29,6 +30,7 @@ from sl2sync import (build_parser, estimate_time_model, gnss_motion, make_proj,
 
 APP_VERSION = "0.1.0"
 GITHUB_REPO = "andrewkena/omjet-gidro"
+ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "gidro.ico")
 
 BASEMAPS = {
     "Google Спутник": dict(
@@ -449,8 +451,7 @@ def build_echogram_image(records, depth_m=None):
     if not lengths:
         return None, None
     rows = max(lengths)
-    max_depth = max(depth_m) if depth_m else 0.0
-    if not depth_m or max_depth <= 0:
+    if not depth_m or max(depth_m) <= 0:
         arr = np.zeros((rows, len(records)), dtype=np.uint8)
         valid = np.zeros((rows, len(records)), dtype=bool)
         for col, r in enumerate(records):
@@ -460,6 +461,16 @@ def build_echogram_image(records, depth_m=None):
                 valid[:n, col] = True
         return arr, valid
 
+    # Одиночный пинг с ошибочно определённой сонаром глубиной (потеря дна на
+    # шуме/структуре/термоклине) растягивал бы свой столбец на неверный
+    # масштаб и торчал резким одиночным скачком на фоне соседних пингов —
+    # сглаживаем опорную глубину медианным фильтром (только для масштаба
+    # картинки, на глубины в CSV/на карте это не влияет).
+    depth_arr = np.asarray(depth_m, dtype=np.float64)
+    window = min(9, len(depth_arr) - 1 + len(depth_arr) % 2)
+    depth_anchor = median_filter(depth_arr, size=window, mode="nearest") if window >= 3 else depth_arr
+    max_depth = float(np.max(depth_anchor))
+
     # За пределами глубины конкретного пинга (мельче общего максимума по треку)
     # данных нет — это не «нулевой сигнал», а «неизвестно», отмечаем отдельной
     # маской, иначе ноль амплитуды в jet-палитре красится тёмно-синим и его не
@@ -467,7 +478,7 @@ def build_echogram_image(records, depth_m=None):
     target_y = np.linspace(0.0, max_depth, rows)
     arr = np.zeros((rows, len(records)), dtype=np.uint8)
     valid = np.zeros((rows, len(records)), dtype=bool)
-    for col, (r, d) in enumerate(zip(records, depth_m)):
+    for col, (r, d) in enumerate(zip(records, depth_anchor)):
         if r and d > 0:
             src = np.frombuffer(r, dtype=np.uint8).astype(np.float32)
             src_depth = np.linspace(0.0, d, len(src))
@@ -952,6 +963,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ОМДЖЕТ Гидро")
+        self.setWindowIcon(QIcon(ICON_PATH))
         self.resize(1100, 800)
         self.settings = QSettings("sl2sync", "gui")
         QWebEngineProfile.defaultProfile().setHttpCacheMaximumSize(
@@ -1443,6 +1455,7 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(ICON_PATH))
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
