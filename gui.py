@@ -20,9 +20,9 @@ from PySide6.QtGui import QColor, QDesktopServices, QIcon, QImage, QPainter, QPi
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QColorDialog, QComboBox, QDialog,
                                 QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
-                                QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+                                QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMenu,
                                 QMainWindow, QMessageBox, QPushButton, QRadioButton,
                                 QScrollArea, QSlider, QSpinBox, QVBoxLayout, QWidget)
 
@@ -553,11 +553,16 @@ def merge_gnss_tracks(gnss_paths):
     return {k: v[order] for k, v in merged.items()}
 
 
-def compute_isobaths(lat, lon, depth, waterline_points, cell, interval):
-    """Грид глубин (линейная интерполяция) + линии постоянной глубины через
-    matplotlib.contour. Точки уреза воды (нарисованные вручную, глубина 0)
-    подмешиваются к данным эхолота — это стандартный приём в батиметрии:
-    сонар не измеряет вплотную к берегу, а урез задаёт границу 0 м."""
+def compute_isobaths(lat, lon, depth, waterline_points, cell, interval, fill_steps):
+    """Грид глубин (линейная интерполяция) + линии постоянной глубины и залитые
+    диапазоны глубин через matplotlib.contour/contourf. Точки уреза воды
+    (нарисованные вручную, глубина 0) подмешиваются к данным эхолота — это
+    стандартный приём в батиметрии: сонар не измеряет вплотную к берегу,
+    а урез задаёт границу 0 м.
+
+    Упрощение: контуры каждого диапазона заливки отдаются как есть, без
+    различения внешних границ и дырок (островов) — для типичной акватории
+    без островов внутри снятой площади это не имеет значения."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -580,25 +585,43 @@ def compute_isobaths(lat, lon, depth, waterline_points, cell, interval):
     Z = griddata((E, N), depth_arr, (GX, GY), method="linear")
     if np.all(np.isnan(Z)):
         raise ValueError("Не удалось построить сетку — проверьте данные")
+    Zm = np.ma.masked_invalid(Z)
 
     zmin, zmax = float(np.nanmin(Z)), float(np.nanmax(Z))
     start = np.ceil(zmin / interval) * interval
-    levels = np.arange(start, zmax, interval)
-    if len(levels) == 0:
+    line_levels = np.arange(start, zmax, interval)
+    if len(line_levels) == 0:
         raise ValueError("Нет подходящих уровней изобат — измените шаг")
 
     fig, ax = plt.subplots()
-    cs = ax.contour(GX, GY, np.ma.masked_invalid(Z), levels=levels)
-    contours = []
+    cs = ax.contour(GX, GY, Zm, levels=line_levels)
+    lines = []
     for level, segs in zip(cs.levels, cs.allsegs):
         for seg in segs:
             if len(seg) < 2:
                 continue
             lon_c, lat_c = inv.transform(seg[:, 0], seg[:, 1])
-            contours.append(dict(level=float(level),
-                                  coords=[[float(la), float(lo)] for la, lo in zip(lat_c, lon_c)]))
+            lines.append(dict(level=float(level),
+                               coords=[[float(la), float(lo)] for la, lo in zip(lat_c, lon_c)]))
+
+    bands = []
+    fill_steps = max(1, int(fill_steps))
+    if zmax > zmin:
+        fill_levels = np.linspace(zmin, zmax, fill_steps + 1)
+        csf = ax.contourf(GX, GY, Zm, levels=fill_levels)
+        for i, segs in enumerate(csf.allsegs):
+            rings = []
+            for seg in segs:
+                if len(seg) < 3:
+                    continue
+                lon_c, lat_c = inv.transform(seg[:, 0], seg[:, 1])
+                rings.append([[float(la), float(lo)] for la, lo in zip(lat_c, lon_c)])
+            if rings:
+                lo_level = float(fill_levels[i])
+                hi_level = float(fill_levels[i + 1]) if i + 1 < len(fill_levels) else zmax
+                bands.append(dict(lo=lo_level, hi=hi_level, rings=rings))
     plt.close(fig)
-    return contours
+    return dict(lines=lines, bands=bands, zmin=zmin, zmax=zmax)
 
 
 def build_isobaths_map_html(basemap, lat, lon):
@@ -611,7 +634,10 @@ def build_isobaths_map_html(basemap, lat, lon):
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
 <style>html,body,#map{{height:100%;margin:0}}
-.iso-tip{{background:#222;color:#fff;border:none;font:11px sans-serif}}</style>
+.iso-line-label{{background:rgba(255,255,255,.85);color:#000;padding:0 3px;
+               border-radius:2px;white-space:nowrap;font-family:sans-serif;line-height:1.4}}
+.iso-area-label{{background:rgba(0,0,0,.55);color:#fff;padding:1px 5px;
+               border-radius:3px;white-space:nowrap;font-family:sans-serif;line-height:1.4}}</style>
 </head><body>
 <div id="map"></div>
 <script>
@@ -620,14 +646,14 @@ L.tileLayer('{tile["url"]}', {{maxZoom: {tile["max_zoom"]}}}).addTo(map);
 var pts = {json.dumps(pts)};
 var ptsLayer = L.featureGroup();
 pts.forEach(function (p) {{
-  L.circleMarker([p[0], p[1]], {{radius: 2, weight: 0, fillColor: '#888', fillOpacity: 0.6}}).addTo(ptsLayer);
+  L.circleMarker([p[0], p[1]], {{radius: 2, weight: 0, fillColor: '#ff0000', fillOpacity: 0.7}}).addTo(ptsLayer);
 }});
 ptsLayer.addTo(map);
 if (pts.length) {{ map.fitBounds(ptsLayer.getBounds()); }}
 
 var drawMode = false;
 var waterline = [];
-var waterlineLine = L.polyline([], {{color: 'red', weight: 3}}).addTo(map);
+var waterlineLine = L.polyline([], {{color: '#ffa500', weight: 3}}).addTo(map);
 var waterlineMarkers = L.layerGroup().addTo(map);
 
 function setDrawMode(v) {{ drawMode = v; }}
@@ -644,34 +670,79 @@ map.on('click', function (e) {{
   if (!drawMode) {{ return; }}
   waterline.push([e.latlng.lat, e.latlng.lng]);
   waterlineLine.setLatLngs(waterline);
-  L.circleMarker(e.latlng, {{radius: 3, color: 'red', fillColor: 'red', fillOpacity: 1}}).addTo(waterlineMarkers);
+  L.circleMarker(e.latlng, {{radius: 3, color: '#ffa500', fillColor: '#ffa500', fillOpacity: 1}}).addTo(waterlineMarkers);
   if (bridge) {{ bridge.mapClicked(e.latlng.lat, e.latlng.lng); }}
 }});
 
-var isobathsLayer = L.layerGroup().addTo(map);
-function drawIsobaths(data) {{
-  isobathsLayer.clearLayers();
-  data.forEach(function (c) {{
-    var line = L.polyline(c.coords, {{color: c.color, weight: 2}});
-    line.bindTooltip(c.level.toFixed(1) + ' м', {{className: 'iso-tip'}});
-    line.addTo(isobathsLayer);
+var fillLayer = L.layerGroup().addTo(map);
+var linesLayer = L.layerGroup().addTo(map);
+var labelsLayer = L.layerGroup().addTo(map);
+
+function clearIsobaths() {{
+  fillLayer.clearLayers();
+  linesLayer.clearLayers();
+  labelsLayer.clearLayers();
+}}
+
+function ringCentroid(rings) {{
+  var cx = 0, cy = 0, n = 0;
+  rings.forEach(function (ring) {{
+    ring.forEach(function (p) {{ cx += p[0]; cy += p[1]; n++; }});
+  }});
+  return n ? [cx / n, cy / n] : null;
+}}
+
+function drawIsobaths(payload) {{
+  clearIsobaths();
+  var style = payload.style || {{}};
+  var lineColor = style.lineColor || '#3388ff';
+  var lineWidth = style.lineWidth || 2;
+  var labelSize = style.labelSize || 11;
+  var labelFreq = Math.max(1, style.labelFreq || 40);
+  var fillOpacity = style.fillOpacity != null ? style.fillOpacity : 0.5;
+
+  (payload.bands || []).forEach(function (b) {{
+    b.rings.forEach(function (ring) {{
+      if (ring.length < 3) {{ return; }}
+      L.polygon(ring, {{stroke: false, fillColor: b.color, fillOpacity: fillOpacity}}).addTo(fillLayer);
+    }});
+    var c = ringCentroid(b.rings);
+    if (c) {{
+      var text = b.lo.toFixed(1) + '–' + b.hi.toFixed(1) + ' м';
+      L.marker(c, {{
+        icon: L.divIcon({{className: 'iso-area-label', iconSize: null,
+                          html: '<span style="font-size:' + labelSize + 'px">' + text + '</span>'}}),
+        interactive: false
+      }}).addTo(labelsLayer);
+    }}
+  }});
+
+  (payload.lines || []).forEach(function (c) {{
+    L.polyline(c.coords, {{color: lineColor, weight: lineWidth}}).addTo(linesLayer);
+    for (var i = 0; i < c.coords.length; i += labelFreq) {{
+      L.marker(c.coords[i], {{
+        icon: L.divIcon({{className: 'iso-line-label', iconSize: null,
+                          html: '<span style="font-size:' + labelSize + 'px">' +
+                                c.level.toFixed(1) + '</span>'}}),
+        interactive: false
+      }}).addTo(labelsLayer);
+    }}
   }});
 }}
 </script>
 </body></html>"""
 
 
-def build_isobaths_js(contours):
-    if not contours:
-        return "drawIsobaths([]);"
-    levels = [c["level"] for c in contours]
-    lo, hi = min(levels), max(levels)
-    data = []
-    for c in contours:
-        t = (c["level"] - lo) / (hi - lo) if hi > lo else 0.0
-        color = f"hsl({int(220 - 220 * t)},80%,55%)"
-        data.append(dict(level=c["level"], coords=c["coords"], color=color))
-    return f"drawIsobaths({json.dumps(data)});"
+def build_isobaths_js(result, style):
+    payload = dict(lines=result.get("lines", []), style=style)
+    bands = result.get("bands", [])
+    n = len(bands)
+    payload["bands"] = []
+    for i, b in enumerate(bands):
+        t = i / max(1, n - 1)
+        color = f"hsl({int(220 - 220 * t)},75%,50%)"
+        payload["bands"].append(dict(lo=b["lo"], hi=b["hi"], rings=b["rings"], color=color))
+    return f"drawIsobaths({json.dumps(payload)});"
 
 
 def compute_time_offset(sl2_path, gnss_paths):
@@ -1021,9 +1092,11 @@ class IsobathsDialog(QDialog):
     def __init__(self, parent):
         super().__init__(parent)
         self.setWindowTitle("Построение изобат")
-        self.resize(1100, 700)
+        self.resize(1150, 700)
         self.main_window = parent
         self.waterline_points = []
+        self.last_result = None
+        self.line_color = QColor("#3388ff")
 
         self.bridge = MapClickBridge(self.on_map_clicked)
         self.channel = QWebChannel()
@@ -1061,29 +1134,115 @@ class IsobathsDialog(QDialog):
 
         self.waterline_label = QLabel("Точек уреза: 0")
 
+        line_group = QGroupBox("Линии изобат")
+        self.line_width_spin = QSpinBox()
+        self.line_width_spin.setRange(1, 10)
+        self.line_width_spin.setValue(2)
+        self.line_width_spin.valueChanged.connect(self.apply_style)
+        line_width_row = QHBoxLayout()
+        line_width_row.addWidget(QLabel("Толщина:"))
+        line_width_row.addWidget(self.line_width_spin)
+        self.line_color_btn = QPushButton()
+        self.line_color_btn.clicked.connect(self.pick_line_color)
+        self._update_line_color_btn()
+        line_color_row = QHBoxLayout()
+        line_color_row.addWidget(QLabel("Цвет:"))
+        line_color_row.addWidget(self.line_color_btn)
+        line_layout = QVBoxLayout()
+        line_layout.addLayout(line_width_row)
+        line_layout.addLayout(line_color_row)
+        line_group.setLayout(line_layout)
+
+        label_group = QGroupBox("Подписи изобат")
+        self.label_size_spin = QSpinBox()
+        self.label_size_spin.setRange(6, 30)
+        self.label_size_spin.setValue(11)
+        self.label_size_spin.valueChanged.connect(self.apply_style)
+        label_size_row = QHBoxLayout()
+        label_size_row.addWidget(QLabel("Размер шрифта:"))
+        label_size_row.addWidget(self.label_size_spin)
+        self.label_freq_spin = QSpinBox()
+        self.label_freq_spin.setRange(5, 500)
+        self.label_freq_spin.setValue(40)
+        self.label_freq_spin.valueChanged.connect(self.apply_style)
+        label_freq_row = QHBoxLayout()
+        label_freq_row.addWidget(QLabel("Частота (точек):"))
+        label_freq_row.addWidget(self.label_freq_spin)
+        label_layout = QVBoxLayout()
+        label_layout.addLayout(label_size_row)
+        label_layout.addLayout(label_freq_row)
+        label_layout.addWidget(QLabel("Подписи диапазонов глубин внутри заливки —\n"
+                                       "тем же шрифтом, в центре каждой области."))
+        label_group.setLayout(label_layout)
+
+        fill_group = QGroupBox("Заливка изобат")
+        self.fill_opacity_spin = QSpinBox()
+        self.fill_opacity_spin.setRange(0, 100)
+        self.fill_opacity_spin.setValue(50)
+        self.fill_opacity_spin.setSuffix(" %")
+        self.fill_opacity_spin.valueChanged.connect(self.apply_style)
+        fill_opacity_row = QHBoxLayout()
+        fill_opacity_row.addWidget(QLabel("Прозрачность:"))
+        fill_opacity_row.addWidget(self.fill_opacity_spin)
+        self.fill_steps_spin = QSpinBox()
+        self.fill_steps_spin.setRange(2, 30)
+        self.fill_steps_spin.setValue(8)
+        fill_steps_row = QHBoxLayout()
+        fill_steps_row.addWidget(QLabel("Ступеней:"))
+        fill_steps_row.addWidget(self.fill_steps_spin)
+        fill_layout = QVBoxLayout()
+        fill_layout.addLayout(fill_opacity_row)
+        fill_layout.addLayout(fill_steps_row)
+        fill_group.setLayout(fill_layout)
+
         settings_layout = QVBoxLayout()
         settings_layout.addLayout(interval_row)
         settings_layout.addLayout(cell_row)
         settings_layout.addWidget(self.draw_btn)
         settings_layout.addWidget(clear_waterline_btn)
         settings_layout.addWidget(self.waterline_label)
+        settings_layout.addWidget(line_group)
+        settings_layout.addWidget(label_group)
+        settings_layout.addWidget(fill_group)
         settings_layout.addStretch(1)
         settings_widget = QWidget()
         settings_widget.setLayout(settings_layout)
-        settings_widget.setFixedWidth(220)
+        settings_widget.setFixedWidth(240)
 
         content_row = QHBoxLayout()
         content_row.addWidget(settings_widget)
         content_row.addWidget(self.map_view, 1)
 
         self.status_label = QLabel("")
+
         build_btn = QPushButton("Построить")
         build_btn.clicked.connect(self.build_isobaths)
+        sep1 = QFrame()
+        sep1.setFrameShape(QFrame.Shape.VLine)
+        sep1.setFrameShadow(QFrame.Shadow.Sunken)
+        delete_btn = QPushButton("Удалить изобаты")
+        delete_btn.clicked.connect(self.delete_isobaths)
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.VLine)
+        sep2.setFrameShadow(QFrame.Shadow.Sunken)
+
+        save_btn = QPushButton("Сохранить")
+        save_menu = QMenu(save_btn)
+        save_menu.addAction("Изображение (PNG)…", self.save_as_image)
+        save_btn.setMenu(save_menu)
+
+        bottom_row = QHBoxLayout()
+        bottom_row.addWidget(build_btn)
+        bottom_row.addWidget(sep1)
+        bottom_row.addWidget(delete_btn)
+        bottom_row.addWidget(sep2)
+        bottom_row.addWidget(save_btn)
+        bottom_row.addStretch(1)
 
         layout = QVBoxLayout()
         layout.addLayout(content_row, 1)
         layout.addWidget(self.status_label)
-        layout.addWidget(build_btn)
+        layout.addLayout(bottom_row)
         self.setLayout(layout)
 
     def on_draw_toggled(self, checked):
@@ -1102,6 +1261,29 @@ class IsobathsDialog(QDialog):
         self.waterline_label.setText("Точек уреза: 0")
         self.map_view.page().runJavaScript("clearWaterline();")
 
+    def _update_line_color_btn(self):
+        self.line_color_btn.setStyleSheet(f"background-color: {self.line_color.name()};")
+        self.line_color_btn.setText(self.line_color.name())
+
+    def pick_line_color(self):
+        color = QColorDialog.getColor(self.line_color, self, "Цвет изобат")
+        if color.isValid():
+            self.line_color = color
+            self._update_line_color_btn()
+            self.apply_style()
+
+    def current_style(self):
+        return dict(lineColor=self.line_color.name(),
+                    lineWidth=self.line_width_spin.value(),
+                    labelSize=self.label_size_spin.value(),
+                    labelFreq=self.label_freq_spin.value(),
+                    fillOpacity=self.fill_opacity_spin.value() / 100.0)
+
+    def apply_style(self, *_args):
+        if self.last_result is None:
+            return
+        self.map_view.page().runJavaScript(build_isobaths_js(self.last_result, self.current_style()))
+
     def build_isobaths(self):
         points = self.main_window.points or {}
         lat, lon, depth = points.get("lat", []), points.get("lon", []), points.get("value", [])
@@ -1111,12 +1293,31 @@ class IsobathsDialog(QDialog):
             return
         self.status_label.setText("Строю изобаты…")
         run_async(lambda: compute_isobaths(lat, lon, depth, list(self.waterline_points),
-                                            self.cell_spin.value(), self.interval_spin.value()),
+                                            self.cell_spin.value(), self.interval_spin.value(),
+                                            self.fill_steps_spin.value()),
                   on_finished=self.on_built, on_error=self.on_build_error)
 
-    def on_built(self, contours):
-        self.status_label.setText(f"Построено изобат: {len(contours)}")
-        self.map_view.page().runJavaScript(build_isobaths_js(contours))
+    def on_built(self, result):
+        self.last_result = result
+        self.status_label.setText(f"Построено изобат: {len(result['lines'])}, "
+                                   f"диапазонов заливки: {len(result['bands'])}")
+        self.apply_style()
+
+    def delete_isobaths(self):
+        self.last_result = None
+        self.status_label.setText("Изобаты удалены")
+        self.map_view.page().runJavaScript("clearIsobaths();")
+
+    def save_as_image(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Сохранить изображение", "", "PNG (*.png)")
+        if not path:
+            return
+        if not path.lower().endswith(".png"):
+            path += ".png"
+        if self.map_view.grab().save(path, "PNG"):
+            self.status_label.setText(f"Сохранено: {path}")
+        else:
+            QMessageBox.warning(self, "Сохранение", "Не удалось сохранить изображение.")
 
     def on_build_error(self, message):
         self.status_label.setText(f"Ошибка: {message}")
