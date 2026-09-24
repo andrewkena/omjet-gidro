@@ -383,15 +383,33 @@ def format_axis_label(v, axis_mode):
     return f"{m}:{sec:02d}"
 
 
-def build_echogram_image(records):
+def build_echogram_image(records, depth_m=None):
+    """Каждый пинг может писаться с своим диапазоном (автодиапазон сонара) —
+    номер байта сам по себе НЕ соответствует одной и той же глубине в разных
+    пингах. Если известна глубина дна по пингу (depth_m, из заголовка кадра),
+    растягиваем/сжимаем сырые байты каждого столбца так, будто они снятые на
+    диапазон 0..depth_m[i], и ресэмплим на общую сетку 0..max(depth_m) —
+    это даёт единый вертикальный масштаб по всей картинке. Без этого разные
+    диапазоны дают рваную, скачущую по глубине картинку."""
     lengths = [len(r) for r in records if r]
     if not lengths:
         return None
-    max_len = max(lengths)
-    arr = np.zeros((max_len, len(records)), dtype=np.uint8)
-    for col, r in enumerate(records):
-        if r:
-            arr[:len(r), col] = np.frombuffer(r, dtype=np.uint8)
+    rows = max(lengths)
+    max_depth = max(depth_m) if depth_m else 0.0
+    if not depth_m or max_depth <= 0:
+        arr = np.zeros((rows, len(records)), dtype=np.uint8)
+        for col, r in enumerate(records):
+            if r:
+                arr[:len(r), col] = np.frombuffer(r, dtype=np.uint8)
+        return arr
+
+    target_y = np.linspace(0.0, max_depth, rows)
+    arr = np.zeros((rows, len(records)), dtype=np.uint8)
+    for col, (r, d) in enumerate(zip(records, depth_m)):
+        if r and d > 0:
+            src = np.frombuffer(r, dtype=np.uint8).astype(np.float32)
+            src_depth = np.linspace(0.0, d, len(src))
+            arr[:, col] = np.interp(target_y, src_depth, src, left=0.0, right=0.0)
     return arr
 
 
@@ -582,7 +600,7 @@ class EchogramViewDialog(QDialog):
                   on_finished=self.on_loaded, on_error=self.on_error)
 
     def on_loaded(self, data):
-        arr = build_echogram_image(data["records"])
+        arr = build_echogram_image(data["records"], data["depth_m"])
         if arr is None:
             self.status_label.setText("В файле нет данных эхограммы")
             return
