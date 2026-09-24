@@ -14,15 +14,15 @@ import urllib.request
 from datetime import datetime, timedelta
 
 import numpy as np
-from PySide6.QtCore import QSettings, Qt, QTimer, QUrl
-from PySide6.QtGui import QDesktopServices, QImage, QPixmap
+from PySide6.QtCore import QRect, QSettings, QSize, Qt, QTimer, QUrl
+from PySide6.QtGui import QColor, QDesktopServices, QImage, QPainter, QPixmap
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                                 QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
                                 QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
                                 QMainWindow, QMessageBox, QPushButton, QRadioButton,
-                                QScrollArea, QSpinBox, QVBoxLayout, QWidget)
+                                QScrollArea, QSlider, QSpinBox, QVBoxLayout, QWidget)
 
 from sl2sync import (build_parser, estimate_time_model, gnss_motion, make_proj,
                       ping_positions, read_gnss, read_sl2)
@@ -362,7 +362,15 @@ def read_echogram_waterfall(sl2_path):
     там же) — по общепринятому для sl2 предположению это 8-битная амплитуда
     по глубине, старт столбца сверху (поверхность) вниз (дно)."""
     s, info = read_sl2(sl2_path, with_echogram=True)
-    return dict(records=s["echogram"], depth_m=s["depth_m"].tolist())
+    return dict(records=s["echogram"], depth_m=s["depth_m"].tolist(),
+                t_rel=s["t_rel"].tolist(), dist=cumulative_distance(s["lat"], s["lon"]))
+
+
+def format_axis_label(v, axis_mode):
+    if axis_mode == "distance":
+        return f"{v / 1000:.1f} км" if v >= 1000 else f"{v:.0f} м"
+    m, sec = divmod(int(round(v)), 60)
+    return f"{m}:{sec:02d}"
 
 
 def build_echogram_image(records):
@@ -442,21 +450,122 @@ def compute_time_offset(sl2_path, gnss_paths):
     )
 
 
+class EchogramCanvas(QWidget):
+    RULER_W = 55
+    AXIS_H = 22
+
+    def __init__(self):
+        super().__init__()
+        self.arr = None
+        self.image = None
+        self.depth_m = []
+        self.axis_vals = []
+        self.axis_mode = "time"
+        self.zoom = 1.0
+        self.contrast = 1.0
+        self.setMouseTracking(True)
+
+    def set_data(self, arr, depth_m, axis_vals, axis_mode):
+        self.arr = arr
+        self.depth_m = depth_m
+        self.axis_vals = axis_vals or list(range(arr.shape[1]))
+        self.axis_mode = axis_mode
+        self._rebuild_image()
+        self.updateGeometry()
+        self.resize(self.sizeHint())
+        self.update()
+
+    def set_contrast(self, value):
+        self.contrast = value
+        self._rebuild_image()
+        self.update()
+
+    def _rebuild_image(self):
+        if self.arr is None:
+            return
+        adj = np.clip((self.arr.astype(np.float32) - 128.0) * self.contrast + 128.0, 0, 255)
+        self.image = array_to_qimage(adj.astype(np.uint8))
+
+    def sizeHint(self):
+        if self.image is None:
+            return QSize(400, 200)
+        return QSize(self.RULER_W + int(self.image.width() * self.zoom),
+                     int(self.image.height() * self.zoom) + self.AXIS_H)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("black"))
+        if self.image is None:
+            painter.setPen(QColor("white"))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Чтение файла…")
+            return
+        w = int(self.image.width() * self.zoom)
+        h = int(self.image.height() * self.zoom)
+        painter.drawImage(QRect(self.RULER_W, 0, w, h), self.image)
+        self._draw_depth_ruler(painter, h)
+        self._draw_axis(painter, w, h)
+
+    def _draw_depth_ruler(self, painter, h):
+        painter.setPen(QColor("#ccc"))
+        max_depth = max(self.depth_m) if self.depth_m else 0.0
+        ticks = max(2, min(10, h // 40))
+        for k in range(ticks + 1):
+            frac = k / ticks
+            y = frac * h
+            painter.drawLine(self.RULER_W - 5, int(y), self.RULER_W, int(y))
+            label = f"{frac * max_depth:.1f}"
+            painter.drawText(2, min(int(y) + 4, h), label)
+
+    def _draw_axis(self, painter, w, h):
+        painter.setPen(QColor("#ccc"))
+        if len(self.axis_vals) < 2:
+            return
+        a0, a1 = self.axis_vals[0], self.axis_vals[-1]
+        ticks = max(2, min(10, w // 90))
+        for k in range(ticks + 1):
+            frac = k / ticks
+            x = self.RULER_W + frac * w
+            label = format_axis_label(a0 + frac * (a1 - a0), self.axis_mode)
+            painter.drawLine(int(x), h, int(x), h + 4)
+            painter.drawText(int(x) - 15, h + self.AXIS_H - 4, label)
+
+    def wheelEvent(self, event):
+        if self.image is None:
+            return
+        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        self.zoom = max(0.1, min(20.0, self.zoom * factor))
+        self.updateGeometry()
+        self.resize(self.sizeHint())
+        self.update()
+        event.accept()
+
+
 class EchogramViewDialog(QDialog):
-    def __init__(self, parent, sl2_path):
+    def __init__(self, parent, sl2_path, axis_mode="time"):
         super().__init__(parent)
         self.setWindowTitle(f"Эхограмма — {os.path.basename(sl2_path)}")
         self.resize(1000, 500)
+        self.axis_mode = axis_mode
 
-        self.image_label = QLabel("Чтение файла…")
-        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setStyleSheet("background: black; color: white;")
+        self.status_label = QLabel("Чтение файла…")
+        self.canvas = EchogramCanvas()
         scroll = QScrollArea()
-        scroll.setWidget(self.image_label)
+        scroll.setWidget(self.canvas)
         scroll.setWidgetResizable(False)
 
+        self.contrast_slider = QSlider(Qt.Orientation.Horizontal)
+        self.contrast_slider.setRange(20, 400)
+        self.contrast_slider.setValue(100)
+        self.contrast_slider.valueChanged.connect(
+            lambda v: self.canvas.set_contrast(v / 100.0))
+        contrast_row = QHBoxLayout()
+        contrast_row.addWidget(QLabel("Контраст:"))
+        contrast_row.addWidget(self.contrast_slider)
+
         layout = QVBoxLayout()
-        layout.addWidget(scroll)
+        layout.addWidget(self.status_label)
+        layout.addWidget(scroll, 1)
+        layout.addLayout(contrast_row)
         self.setLayout(layout)
 
         run_async(lambda: read_echogram_waterfall(sl2_path),
@@ -465,15 +574,15 @@ class EchogramViewDialog(QDialog):
     def on_loaded(self, data):
         arr = build_echogram_image(data["records"])
         if arr is None:
-            self.image_label.setText("В файле нет данных эхограммы")
+            self.status_label.setText("В файле нет данных эхограммы")
             return
-        qimg = array_to_qimage(arr)
-        pixmap = QPixmap.fromImage(qimg)
-        self.image_label.setPixmap(pixmap)
-        self.image_label.setFixedSize(pixmap.size())
+        self.status_label.setText(f"{arr.shape[1]} пингов, {arr.shape[0]} байт по глубине "
+                                   f"(колесо мыши — масштаб)")
+        axis_vals = data["dist"] if self.axis_mode == "distance" else data["t_rel"]
+        self.canvas.set_data(arr, data["depth_m"], axis_vals, self.axis_mode)
 
     def on_error(self, message):
-        self.image_label.setText(f"Ошибка чтения: {message}")
+        self.status_label.setText(f"Ошибка чтения: {message}")
 
 
 class OffsetDialog(QDialog):
@@ -875,7 +984,8 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Просмотр эхограммы",
                                      "Сначала выберите один файл эхограммы (кнопка «Обзор…»).")
             return
-        dlg = EchogramViewDialog(self, path)
+        axis_mode = self.settings.value("timeline_axis", "time")
+        dlg = EchogramViewDialog(self, path, axis_mode)
         dlg.exec()
 
     def pick_gnss(self):
