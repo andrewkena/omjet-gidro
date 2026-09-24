@@ -14,7 +14,7 @@ import urllib.request
 from datetime import datetime, timedelta
 
 import numpy as np
-from PySide6.QtCore import QRect, QSettings, QSize, Qt, QTimer, QUrl
+from PySide6.QtCore import QRect, QSettings, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QImage, QPainter, QPixmap
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -72,7 +72,7 @@ def load_html(view, html, name):
 
 
 def build_map_html(basemap, points, color_by_depth=True, vmin=None, vmax=None, steps=32,
-                    axis_mode="time"):
+                    axis_mode="time", legend_title="Глубина, м", tooltip_suffix=" м"):
     tile = BASEMAPS[basemap]
     lat, lon, val = points["lat"], points["lon"], points["value"]
     axis_key = "dist" if axis_mode == "distance" else "t_rel"
@@ -152,8 +152,8 @@ var layer = L.geoJSON(data, {{
   pointToLayer: function (f, latlng) {{
     var m = L.circleMarker(latlng, {{radius: 3, weight: 0, fillOpacity: 0.85,
                                       fillColor: color(f.properties.v), color: color(f.properties.v)}});
-    m.bindTooltip(f.properties.v.toFixed(2) + ' м', {{sticky: true}});
-    m.on('mouseover', function () {{ drawTimeline(f.properties.i); }});
+    m.bindTooltip(f.properties.v.toFixed(2) + {json.dumps(tooltip_suffix)}, {{sticky: true}});
+    m.on('mouseover', function () {{ showAtIndex(f.properties.i); }});
     return m;
   }}
 }}).addTo(map);
@@ -226,7 +226,7 @@ function showAtIndex(i) {{
   var p = pts[Math.max(0, Math.min(pts.length - 1, i))];
   if (!cursorMarker._map) {{ cursorMarker.addTo(map); }}
   cursorMarker.setLatLng([p.lat, p.lon]);
-  cursorMarker.setTooltipContent(p.v.toFixed(2) + ' м');
+  cursorMarker.setTooltipContent(p.v.toFixed(2) + {json.dumps(tooltip_suffix)});
   cursorMarker.openTooltip();
   drawTimeline(i);
 }}
@@ -252,7 +252,7 @@ if (data.features.length) {{
     var legend = L.control({{position: 'bottomright'}});
     legend.onAdd = function () {{
       var div = L.DomUtil.create('div', 'depth-legend');
-      div.innerHTML = '<div>Глубина, м</div><div class="row">' +
+      div.innerHTML = '<div>' + {json.dumps(legend_title)} + '</div><div class="row">' +
         '<div class="bar"></div>' +
         '<div class="scale"><span>' + vmax.toFixed(1) + '</span><span>' + vmin.toFixed(1) + '</span></div>' +
         '</div>';
@@ -339,19 +339,73 @@ def cumulative_distance(lat, lon):
     return np.concatenate([[0.0], np.cumsum(seg)]).tolist()
 
 
+def estimate_bottom_hardness_ping(record, depth_m):
+    """Грубая, неоткалиброванная оценка твёрдости дна по ширине первого пика
+    (резче — твёрже) и наличию второго эха на удвоенной глубине (сигнал
+    поверхность→дно→поверхность→дно; заметен обычно только на твёрдом дне).
+    Формат сырых байт эхограммы не задокументирован и не проверен на реальном
+    железе (см. read_echogram_waterfall) — это ориентировочный индекс, а не
+    калиброванное измерение, как у специализированных систем (RoxAnn, QTC)."""
+    if not record or depth_m is None or depth_m <= 0:
+        return None
+    arr = np.frombuffer(record, dtype=np.uint8).astype(np.float32)
+    if len(arr) < 4:
+        return None
+    i_peak = int(np.argmax(arr))
+    peak_val = arr[i_peak]
+    if peak_val < 20:
+        return None
+    half = peak_val / 2.0
+    left = i_peak
+    while left > 0 and arr[left] > half:
+        left -= 1
+    right = i_peak
+    while right < len(arr) - 1 and arr[right] > half:
+        right += 1
+    width = max(1, right - left)
+    sharpness = 1.0 / width
+
+    second_echo = 0.0
+    i2 = 2 * i_peak
+    if i2 + 2 < len(arr):
+        second_echo = float(np.max(arr[max(0, i2 - 2):i2 + 3])) / 255.0
+    return sharpness, second_echo
+
+
+def compute_hardness_index(records, depth_m):
+    n = len(records)
+    sharpness = np.full(n, np.nan)
+    second = np.zeros(n)
+    for i in range(n):
+        est = estimate_bottom_hardness_ping(records[i], depth_m[i])
+        if est is not None:
+            sharpness[i], second[i] = est
+    finite = sharpness[np.isfinite(sharpness)]
+    if len(finite) > 1:
+        lo, hi = np.nanpercentile(finite, [5, 95])
+        sharp_n = np.clip((sharpness - lo) / max(hi - lo, 1e-9), 0, 1)
+    else:
+        sharp_n = np.zeros(n)
+    sharp_n = np.nan_to_num(sharp_n, nan=0.0)
+    return (0.5 * sharp_n + 0.5 * second).tolist()
+
+
 def read_echogram_file(sl2_path):
-    s, info = read_sl2(sl2_path)
+    s, info = read_sl2(sl2_path, with_echogram=True)
     m = s["has_gps"] & np.isfinite(s["depth_m"]) & (s["depth_m"] > 0)
     lat, lon = s["lat"][m], s["lon"][m]
     t_rel = s["t_rel"][m]
+    depth = s["depth_m"][m]
+    records = [s["echogram"][i] for i in np.where(m)[0]]
+    hardness = compute_hardness_index(records, depth.tolist())
     duration_s = info["duration_s"]
     # sl2 хранит только относительное время (см. docs/CONTEXT.md) — абсолютное
     # время берём от mtime файла (момент завершения записи) и отсчитываем назад.
     end_dt = datetime.fromtimestamp(os.path.getmtime(sl2_path))
     start_dt = end_dt - timedelta(seconds=duration_s)
     return dict(path=sl2_path, lat=lat.tolist(), lon=lon.tolist(),
-                depth=s["depth_m"][m].tolist(), t_rel=t_rel.tolist(),
-                dist=cumulative_distance(lat, lon),
+                depth=depth.tolist(), t_rel=t_rel.tolist(),
+                dist=cumulative_distance(lat, lon), hardness=hardness,
                 start=start_dt.isoformat(), end=end_dt.isoformat(), duration_s=duration_s)
 
 
@@ -420,6 +474,40 @@ def array_to_qimage(arr):
     return img.copy()
 
 
+JET_STOPS = [
+    (0.0, (0, 0, 143)), (0.125, (0, 0, 255)), (0.375, (0, 255, 255)),
+    (0.625, (255, 255, 0)), (0.875, (255, 0, 0)), (1.0, (128, 0, 0)),
+]
+
+
+def _jet_lut():
+    """256-элементная таблица RGB той же палитры, что и точки на карте: слабый
+    сигнал — синий, сильный — красный/тёмно-красный."""
+    lut = np.zeros((256, 3), dtype=np.uint8)
+    for i in range(256):
+        t = i / 255.0
+        for j in range(len(JET_STOPS) - 1):
+            a0, c0 = JET_STOPS[j]
+            a1, c1 = JET_STOPS[j + 1]
+            if t <= a1 or j == len(JET_STOPS) - 2:
+                f = (t - a0) / (a1 - a0) if a1 > a0 else 0.0
+                lut[i] = [c0[k] + f * (c1[k] - c0[k]) for k in range(3)]
+                break
+    return lut
+
+
+_JET_LUT = _jet_lut()
+
+
+def colorize_echogram(arr):
+    """arr: 2D uint8 (строки — глубина, столбцы — пинги) → цветной QImage
+    по амплитуде через ту же jet-палитру, что и раскраска точек на карте."""
+    rgb = np.ascontiguousarray(_JET_LUT[arr])
+    h, w, _ = rgb.shape
+    img = QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888)
+    return img.copy()
+
+
 def _version_tuple(v):
     out = []
     for p in v.split("."):
@@ -478,9 +566,53 @@ def compute_time_offset(sl2_path, gnss_paths):
     )
 
 
+class DepthRulerWidget(QWidget):
+    """Линейка глубин слева от эхограммы — отдельный виджет вне области
+    горизонтальной прокрутки, чтобы не уезжать вместе с картинкой. По вертикали
+    синхронизируется со скроллом канваса (see EchogramViewDialog)."""
+    WIDTH = 55
+
+    def __init__(self, canvas):
+        super().__init__()
+        self.canvas = canvas
+        self.setFixedWidth(self.WIDTH)
+        self.max_depth = 0.0
+        self.content_height = 0
+        self.scroll_y = 0
+
+    def set_params(self, max_depth, content_height):
+        self.max_depth = max_depth
+        self.content_height = content_height
+        self.update()
+
+    def set_scroll_offset(self, y):
+        self.scroll_y = y
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("black"))
+        if self.content_height <= 0:
+            return
+        painter.setPen(QColor("#ccc"))
+        h = self.height()
+        ticks = max(2, min(12, h // 40))
+        for k in range(ticks + 1):
+            y_viewport = k / ticks * h
+            y_content = self.scroll_y + y_viewport
+            if y_content > self.content_height:
+                continue
+            depth = (y_content / self.content_height) * self.max_depth
+            painter.drawLine(self.WIDTH - 5, int(y_viewport), self.WIDTH, int(y_viewport))
+            painter.drawText(2, min(int(y_viewport) + 4, h - 2), f"{depth:.1f}")
+
+    def wheelEvent(self, event):
+        self.canvas.wheelEvent(event)
+
+
 class EchogramCanvas(QWidget):
-    RULER_W = 55
     AXIS_H = 22
+    zoom_changed = Signal()
 
     def __init__(self):
         super().__init__()
@@ -512,12 +644,12 @@ class EchogramCanvas(QWidget):
         if self.arr is None:
             return
         adj = np.clip((self.arr.astype(np.float32) - 128.0) * self.contrast + 128.0, 0, 255)
-        self.image = array_to_qimage(adj.astype(np.uint8))
+        self.image = colorize_echogram(adj.astype(np.uint8))
 
     def sizeHint(self):
         if self.image is None:
             return QSize(400, 200)
-        return QSize(self.RULER_W + int(self.image.width() * self.zoom),
+        return QSize(int(self.image.width() * self.zoom),
                      int(self.image.height() * self.zoom) + self.AXIS_H)
 
     def paintEvent(self, event):
@@ -529,20 +661,8 @@ class EchogramCanvas(QWidget):
             return
         w = int(self.image.width() * self.zoom)
         h = int(self.image.height() * self.zoom)
-        painter.drawImage(QRect(self.RULER_W, 0, w, h), self.image)
-        self._draw_depth_ruler(painter, h)
+        painter.drawImage(QRect(0, 0, w, h), self.image)
         self._draw_axis(painter, w, h)
-
-    def _draw_depth_ruler(self, painter, h):
-        painter.setPen(QColor("#ccc"))
-        max_depth = max(self.depth_m) if self.depth_m else 0.0
-        ticks = max(2, min(10, h // 40))
-        for k in range(ticks + 1):
-            frac = k / ticks
-            y = frac * h
-            painter.drawLine(self.RULER_W - 5, int(y), self.RULER_W, int(y))
-            label = f"{frac * max_depth:.1f}"
-            painter.drawText(2, min(int(y) + 4, h), label)
 
     def _draw_axis(self, painter, w, h):
         painter.setPen(QColor("#ccc"))
@@ -552,7 +672,7 @@ class EchogramCanvas(QWidget):
         ticks = max(2, min(10, w // 90))
         for k in range(ticks + 1):
             frac = k / ticks
-            x = self.RULER_W + frac * w
+            x = frac * w
             label = format_axis_label(a0 + frac * (a1 - a0), self.axis_mode)
             painter.drawLine(int(x), h, int(x), h + 4)
             painter.drawText(int(x) - 15, h + self.AXIS_H - 4, label)
@@ -565,6 +685,7 @@ class EchogramCanvas(QWidget):
         self.updateGeometry()
         self.resize(self.sizeHint())
         self.update()
+        self.zoom_changed.emit()
         event.accept()
 
 
@@ -577,9 +698,16 @@ class EchogramViewDialog(QDialog):
 
         self.status_label = QLabel("Чтение файла…")
         self.canvas = EchogramCanvas()
+        self.canvas.zoom_changed.connect(self.sync_ruler)
+        self.ruler = DepthRulerWidget(self.canvas)
         scroll = QScrollArea()
         scroll.setWidget(self.canvas)
         scroll.setWidgetResizable(False)
+        scroll.verticalScrollBar().valueChanged.connect(self.ruler.set_scroll_offset)
+
+        content_row = QHBoxLayout()
+        content_row.addWidget(self.ruler)
+        content_row.addWidget(scroll, 1)
 
         self.contrast_slider = QSlider(Qt.Orientation.Horizontal)
         self.contrast_slider.setRange(20, 400)
@@ -592,12 +720,19 @@ class EchogramViewDialog(QDialog):
 
         layout = QVBoxLayout()
         layout.addWidget(self.status_label)
-        layout.addWidget(scroll, 1)
+        layout.addLayout(content_row, 1)
         layout.addLayout(contrast_row)
         self.setLayout(layout)
 
         run_async(lambda: read_echogram_waterfall(sl2_path),
                   on_finished=self.on_loaded, on_error=self.on_error)
+
+    def sync_ruler(self):
+        if self.canvas.image is None:
+            return
+        max_depth = max(self.canvas.depth_m) if self.canvas.depth_m else 0.0
+        content_height = int(self.canvas.image.height() * self.canvas.zoom)
+        self.ruler.set_params(max_depth, content_height)
 
     def on_loaded(self, data):
         arr = build_echogram_image(data["records"], data["depth_m"])
@@ -612,6 +747,7 @@ class EchogramViewDialog(QDialog):
                                    f"(колесо мыши — масштаб){note}")
         axis_vals = data["dist"] if self.axis_mode == "distance" else data["t_rel"]
         self.canvas.set_data(arr, data["depth_m"], axis_vals, self.axis_mode)
+        self.sync_ruler()
 
     def on_error(self, message):
         self.status_label.setText(f"Ошибка чтения: {message}")
@@ -968,13 +1104,14 @@ class MainWindow(QMainWindow):
         self.basemap_combo = QComboBox()
         self.basemap_combo.addItems(BASEMAPS.keys())
         self.basemap_combo.currentTextChanged.connect(self.redraw_map)
-        self.depth_check = QCheckBox("Глубина")
-        self.depth_check.setChecked(True)
-        self.depth_check.toggled.connect(self.redraw_map)
+        self.color_mode_combo = QComboBox()
+        self.color_mode_combo.addItems(["Глубина", "Твёрдость дна", "Нет"])
+        self.color_mode_combo.currentTextChanged.connect(self.redraw_map)
         row3 = QHBoxLayout()
         row3.addWidget(QLabel("Фотоподложка:"))
         row3.addWidget(self.basemap_combo, 1)
-        row3.addWidget(self.depth_check)
+        row3.addWidget(QLabel("Раскраска:"))
+        row3.addWidget(self.color_mode_combo)
 
         left_col = QVBoxLayout()
         left_col.addWidget(crop_group)
@@ -1116,7 +1253,7 @@ class MainWindow(QMainWindow):
         return (axis - axis[0] >= start_cut) & (axis[-1] - axis >= end_cut)
 
     def combine_and_render(self):
-        lat_all, lon_all, val_all, t_all, dist_all = [], [], [], [], []
+        lat_all, lon_all, val_all, t_all, dist_all, hard_all = [], [], [], [], [], []
         t_offset = dist_offset = 0.0
         for f in self.file_data:
             keep = self.crop_mask(f)
@@ -1127,6 +1264,7 @@ class MainWindow(QMainWindow):
             lat_all.extend(np.asarray(f["lat"])[keep].tolist())
             lon_all.extend(np.asarray(f["lon"])[keep].tolist())
             val_all.extend((np.asarray(f["depth"])[keep] + off_m).tolist())
+            hard_all.extend(np.asarray(f["hardness"])[keep].tolist())
             t_all.extend((np.asarray(f["t_rel"])[keep] + t_offset).tolist())
             dist_all.extend((np.asarray(f["dist"])[keep] + dist_offset).tolist())
             # непрерывная ось при нескольких файлах — сдвигаем следующий на длину текущего
@@ -1145,7 +1283,8 @@ class MainWindow(QMainWindow):
             label = f"глубина, м, {n} эхограмм (встроенный GPS Lowrance)"
             start, end, duration_s = None, None, None
 
-        self.points = dict(lat=lat_all, lon=lon_all, value=val_all, t_rel=t_all, dist=dist_all,
+        self.points = dict(lat=lat_all, lon=lon_all, value=val_all, hardness=hard_all,
+                            t_rel=t_all, dist=dist_all,
                             label=label, start=start, end=end, duration_s=duration_s)
         if lat_all:
             self.statusBar().showMessage(f"Готово: {len(lat_all)} точек, {label}")
@@ -1221,14 +1360,25 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Ошибка чтения файла", message)
 
     def redraw_map(self):
-        points = self.points or dict(lat=[], lon=[], value=[], t_rel=[], dist=[])
-        manual = self.settings.value("depth_mode", "auto") == "manual"
-        vmin = float(self.settings.value("depth_min", 0.0)) if manual else None
-        vmax = float(self.settings.value("depth_max", 10.0)) if manual else None
+        points = self.points or dict(lat=[], lon=[], value=[], hardness=[], t_rel=[], dist=[])
+        mode = self.color_mode_combo.currentText()
+        if mode == "Твёрдость дна":
+            map_points = dict(points, value=points.get("hardness", []))
+            color_by, vmin, vmax, legend_title, tooltip_suffix = True, 0.0, 1.0, "Твёрдость дна", ""
+        elif mode == "Глубина":
+            manual = self.settings.value("depth_mode", "auto") == "manual"
+            vmin = float(self.settings.value("depth_min", 0.0)) if manual else None
+            vmax = float(self.settings.value("depth_max", 10.0)) if manual else None
+            map_points = points
+            color_by, legend_title, tooltip_suffix = True, "Глубина, м", " м"
+        else:
+            map_points, color_by, vmin, vmax = points, False, None, None
+            legend_title, tooltip_suffix = "", " м"
         steps = int(self.settings.value("depth_steps", 32))
         axis_mode = self.settings.value("timeline_axis", "time")
-        html = build_map_html(self.basemap_combo.currentText(), points, self.depth_check.isChecked(),
-                               vmin=vmin, vmax=vmax, steps=steps, axis_mode=axis_mode)
+        html = build_map_html(self.basemap_combo.currentText(), map_points, color_by,
+                               vmin=vmin, vmax=vmax, steps=steps, axis_mode=axis_mode,
+                               legend_title=legend_title, tooltip_suffix=tooltip_suffix)
         load_html(self.map_view, html, "main")
 
     def open_settings(self):
