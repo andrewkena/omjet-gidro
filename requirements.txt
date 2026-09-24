@@ -2,5 +2,6 @@ numpy
 scipy
 pyproj
 matplotlib
+PySide6
 # опционально, для GeoTIFF:
 # rasterio

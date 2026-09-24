@@ -78,7 +78,7 @@ def _find_frame(data, start, limit=1 << 20):
     return None
 
 
-def read_sl2(path, channel=None):
+def read_sl2(path, channel=None, with_echogram=False):
     with open(path, "rb") as fh:
         data = fh.read()
     n = len(data)
@@ -93,6 +93,7 @@ def read_sl2(path, channel=None):
     if pos is None:
         pos = _find_frame(data, 0)
     cols = {name: [] for name, _, _ in SL2_FIELDS}
+    echo_raw = [] if with_echogram else None
     resyncs = 0
     while pos is not None and pos + SL2_HDR <= n:
         fs = struct.unpack_from("<H", data, pos + 28)[0]
@@ -102,6 +103,8 @@ def read_sl2(path, channel=None):
             continue
         for name, off, f in SL2_FIELDS:
             cols[name].append(struct.unpack_from(f, data, pos + off)[0])
+        if with_echogram:
+            echo_raw.append(bytes(data[pos + SL2_HDR:pos + fs]))
         pos += fs
     if not cols["channel"]:
         sys.exit("В файле не найдено ни одного кадра sl2")
@@ -115,12 +118,16 @@ def read_sl2(path, channel=None):
     if not m.any():
         sys.exit(f"Канал {channel} отсутствует. Есть: {summary}")
     s = {k: v[m] for k, v in a.items()}
+    if with_echogram:
+        echo_ch = [echo_raw[i] for i in np.where(m)[0]]
 
     s["t_rel"] = s["time_ms"].astype(float) / 1000.0
     order = np.argsort(s["t_rel"], kind="stable")
     if np.any(np.diff(s["t_rel"]) < -1.0):
         log("  ! время в sl2 немонотонно — кадры отсортированы по времени")
     s = {k: v[order] for k, v in s.items()}
+    if with_echogram:
+        s["echogram"] = [echo_ch[i] for i in order]
 
     s["lon"] = np.degrees(s["lon_enc"] / R_POLAR)
     s["lat"] = np.degrees(2 * np.arctan(np.exp(s["lat_enc"] / R_POLAR)) - np.pi / 2)
@@ -634,7 +641,7 @@ def make_report(path, rep, res):
 # ============================================================================
 # main
 # ============================================================================
-def main():
+def build_parser():
     p = argparse.ArgumentParser(
         description="Привязка глубин Lowrance .sl2 к точному GNSS-треку",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -676,8 +683,10 @@ def main():
                      help="не интерполировать дальше этого расстояния от данных, м")
     flt.add_argument("--no-grid", action="store_true")
     flt.add_argument("--grid-dt", type=float, default=0.1, help=argparse.SUPPRESS)
-    args = p.parse_args()
+    return p
 
+
+def run(args):
     out = args.out or os.path.splitext(args.sl2)[0] + "_out"
     os.makedirs(out, exist_ok=True)
     base = os.path.join(out, os.path.splitext(os.path.basename(args.sl2))[0])
@@ -793,6 +802,14 @@ def main():
         log(f"  → {f}")
     log(f"\nЗадержку {res['latency_s']:+.2f} с можно задавать для других записей с той же "
         f"связкой и настройками эхолота: --latency {res['latency_s']}")
+
+    return dict(res=res, files=files,
+                points=dict(lat=lat[sel].tolist(), lon=lon[sel].tolist(),
+                            value=V.tolist(), label=vname))
+
+
+def main():
+    run(build_parser().parse_args())
 
 
 if __name__ == "__main__":

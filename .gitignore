@@ -11,3 +11,9 @@ venv/
 *.pos
 *_out/
 truth.json
+
+# исключение: примеры данных для демонстрации sl2sync
+!examples/data/*.sl2
+!examples/data/*.sl3
+!examples/data/*.nmea
+!examples/data/*.pos
