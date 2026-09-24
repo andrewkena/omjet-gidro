@@ -362,8 +362,18 @@ def read_echogram_waterfall(sl2_path):
     там же) — по общепринятому для sl2 предположению это 8-битная амплитуда
     по глубине, старт столбца сверху (поверхность) вниз (дно)."""
     s, info = read_sl2(sl2_path, with_echogram=True)
-    return dict(records=s["echogram"], depth_m=s["depth_m"].tolist(),
-                t_rel=s["t_rel"].tolist(), dist=cumulative_distance(s["lat"], s["lon"]))
+    # В пределах одного канала могут чередоваться пинги разных частот (например,
+    # CHIRP low/high) — вперемешку они дают полосатую/рваную картинку, поэтому
+    # оставляем только самую частую частоту в этом канале.
+    freqs, counts = np.unique(s["freq"], return_counts=True)
+    dominant = freqs[np.argmax(counts)]
+    mixed_freqs = len(freqs)
+    m = s["freq"] == dominant
+    records = [s["echogram"][i] for i in np.where(m)[0]]
+    return dict(records=records, depth_m=s["depth_m"][m].tolist(),
+                t_rel=s["t_rel"][m].tolist(),
+                dist=cumulative_distance(s["lat"][m], s["lon"][m]),
+                mixed_freqs=mixed_freqs)
 
 
 def format_axis_label(v, axis_mode):
@@ -576,8 +586,12 @@ class EchogramViewDialog(QDialog):
         if arr is None:
             self.status_label.setText("В файле нет данных эхограммы")
             return
+        note = ""
+        if data["mixed_freqs"] > 1:
+            note = (f" — в канале {data['mixed_freqs']} частоты, показана самая частая, "
+                    f"остальные пинги пропущены")
         self.status_label.setText(f"{arr.shape[1]} пингов, {arr.shape[0]} байт по глубине "
-                                   f"(колесо мыши — масштаб)")
+                                   f"(колесо мыши — масштаб){note}")
         axis_vals = data["dist"] if self.axis_mode == "distance" else data["t_rel"]
         self.canvas.set_data(arr, data["depth_m"], axis_vals, self.axis_mode)
 
