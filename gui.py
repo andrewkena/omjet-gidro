@@ -447,24 +447,33 @@ def build_echogram_image(records, depth_m=None):
     диапазоны дают рваную, скачущую по глубине картинку."""
     lengths = [len(r) for r in records if r]
     if not lengths:
-        return None
+        return None, None
     rows = max(lengths)
     max_depth = max(depth_m) if depth_m else 0.0
     if not depth_m or max_depth <= 0:
         arr = np.zeros((rows, len(records)), dtype=np.uint8)
+        valid = np.zeros((rows, len(records)), dtype=bool)
         for col, r in enumerate(records):
             if r:
-                arr[:len(r), col] = np.frombuffer(r, dtype=np.uint8)
-        return arr
+                n = len(r)
+                arr[:n, col] = np.frombuffer(r, dtype=np.uint8)
+                valid[:n, col] = True
+        return arr, valid
 
+    # За пределами глубины конкретного пинга (мельче общего максимума по треку)
+    # данных нет — это не «нулевой сигнал», а «неизвестно», отмечаем отдельной
+    # маской, иначе ноль амплитуды в jet-палитре красится тёмно-синим и его не
+    # отличить от слабого сигнала в толще воды (выглядит как разрыв/дыра).
     target_y = np.linspace(0.0, max_depth, rows)
     arr = np.zeros((rows, len(records)), dtype=np.uint8)
+    valid = np.zeros((rows, len(records)), dtype=bool)
     for col, (r, d) in enumerate(zip(records, depth_m)):
         if r and d > 0:
             src = np.frombuffer(r, dtype=np.uint8).astype(np.float32)
             src_depth = np.linspace(0.0, d, len(src))
             arr[:, col] = np.interp(target_y, src_depth, src, left=0.0, right=0.0)
-    return arr
+            valid[:, col] = target_y <= d
+    return arr, valid
 
 
 def array_to_qimage(arr):
@@ -499,10 +508,15 @@ def _jet_lut():
 _JET_LUT = _jet_lut()
 
 
-def colorize_echogram(arr):
+def colorize_echogram(arr, valid=None):
     """arr: 2D uint8 (строки — глубина, столбцы — пинги) → цветной QImage
-    по амплитуде через ту же jet-палитру, что и раскраска точек на карте."""
+    по амплитуде через ту же jet-палитру, что и раскраска точек на карте.
+    valid: булева маска того же размера — False красится чёрным (нет данных),
+    а не через палитру (иначе ноль амплитуды путается с тёмно-синим слабым
+    сигналом)."""
     rgb = np.ascontiguousarray(_JET_LUT[arr])
+    if valid is not None:
+        rgb[~valid] = 0
     h, w, _ = rgb.shape
     img = QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888)
     return img.copy()
@@ -617,6 +631,7 @@ class EchogramCanvas(QWidget):
     def __init__(self):
         super().__init__()
         self.arr = None
+        self.valid = None
         self.image = None
         self.depth_m = []
         self.axis_vals = []
@@ -625,8 +640,9 @@ class EchogramCanvas(QWidget):
         self.contrast = 1.0
         self.setMouseTracking(True)
 
-    def set_data(self, arr, depth_m, axis_vals, axis_mode):
+    def set_data(self, arr, valid, depth_m, axis_vals, axis_mode):
         self.arr = arr
+        self.valid = valid
         self.depth_m = depth_m
         self.axis_vals = axis_vals or list(range(arr.shape[1]))
         self.axis_mode = axis_mode
@@ -644,7 +660,7 @@ class EchogramCanvas(QWidget):
         if self.arr is None:
             return
         adj = np.clip((self.arr.astype(np.float32) - 128.0) * self.contrast + 128.0, 0, 255)
-        self.image = colorize_echogram(adj.astype(np.uint8))
+        self.image = colorize_echogram(adj.astype(np.uint8), self.valid)
 
     def sizeHint(self):
         if self.image is None:
@@ -735,7 +751,7 @@ class EchogramViewDialog(QDialog):
         self.ruler.set_params(max_depth, content_height)
 
     def on_loaded(self, data):
-        arr = build_echogram_image(data["records"], data["depth_m"])
+        arr, valid = build_echogram_image(data["records"], data["depth_m"])
         if arr is None:
             self.status_label.setText("В файле нет данных эхограммы")
             return
@@ -746,7 +762,7 @@ class EchogramViewDialog(QDialog):
         self.status_label.setText(f"{arr.shape[1]} пингов, {arr.shape[0]} байт по глубине "
                                    f"(колесо мыши — масштаб){note}")
         axis_vals = data["dist"] if self.axis_mode == "distance" else data["t_rel"]
-        self.canvas.set_data(arr, data["depth_m"], axis_vals, self.axis_mode)
+        self.canvas.set_data(arr, valid, data["depth_m"], axis_vals, self.axis_mode)
         self.sync_ruler()
 
     def on_error(self, message):
