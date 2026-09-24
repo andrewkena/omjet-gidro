@@ -14,9 +14,10 @@ import urllib.request
 from datetime import datetime, timedelta
 
 import numpy as np
-from scipy.ndimage import median_filter
-from PySide6.QtCore import QRect, QSettings, QSize, Qt, QTimer, QUrl, Signal
+from scipy.interpolate import griddata
+from PySide6.QtCore import QObject, QRect, QSettings, QSize, Qt, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QColor, QDesktopServices, QIcon, QImage, QPainter, QPixmap
+from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
@@ -440,50 +441,28 @@ def format_axis_label(v, axis_mode):
 
 
 def build_echogram_image(records, depth_m=None):
-    """Каждый пинг может писаться с своим диапазоном (автодиапазон сонара) —
-    номер байта сам по себе НЕ соответствует одной и той же глубине в разных
-    пингах. Если известна глубина дна по пингу (depth_m, из заголовка кадра),
-    растягиваем/сжимаем сырые байты каждого столбца так, будто они снятые на
-    диапазон 0..depth_m[i], и ресэмплим на общую сетку 0..max(depth_m) —
-    это даёт единый вертикальный масштаб по всей картинке. Без этого разные
-    диапазоны дают рваную, скачущую по глубине картинку."""
+    """Складываем сырые байты пинга как есть, без домыслов: строка 0 — начало
+    записи каждого пинга (обычно поверхность), дальше — по возрастанию байта.
+
+    Раньше здесь была попытка растянуть/сжать каждый столбец под глубину дна
+    (depth_m) в предположении диапазон≈глубина — но это предположение,
+    похоже, само по себе неверно (реальный диапазон сонара у Lowrance меняется
+    ступенями автодиапазона, а не совпадает с глубиной), и вносило собственные
+    искажения (острые «иглы» там, где не должно быть). depth_m сейчас не
+    используется — оставлен в сигнатуре на будущее, если формат прояснится.
+    Короткие пинги просто дополняются как «нет данных» (валидная маска), не
+    домысливая физическую глубину по вертикали."""
     lengths = [len(r) for r in records if r]
     if not lengths:
         return None, None
     rows = max(lengths)
-    if not depth_m or max(depth_m) <= 0:
-        arr = np.zeros((rows, len(records)), dtype=np.uint8)
-        valid = np.zeros((rows, len(records)), dtype=bool)
-        for col, r in enumerate(records):
-            if r:
-                n = len(r)
-                arr[:n, col] = np.frombuffer(r, dtype=np.uint8)
-                valid[:n, col] = True
-        return arr, valid
-
-    # Одиночный пинг с ошибочно определённой сонаром глубиной (потеря дна на
-    # шуме/структуре/термоклине) растягивал бы свой столбец на неверный
-    # масштаб и торчал резким одиночным скачком на фоне соседних пингов —
-    # сглаживаем опорную глубину медианным фильтром (только для масштаба
-    # картинки, на глубины в CSV/на карте это не влияет).
-    depth_arr = np.asarray(depth_m, dtype=np.float64)
-    window = min(9, len(depth_arr) - 1 + len(depth_arr) % 2)
-    depth_anchor = median_filter(depth_arr, size=window, mode="nearest") if window >= 3 else depth_arr
-    max_depth = float(np.max(depth_anchor))
-
-    # За пределами глубины конкретного пинга (мельче общего максимума по треку)
-    # данных нет — это не «нулевой сигнал», а «неизвестно», отмечаем отдельной
-    # маской, иначе ноль амплитуды в jet-палитре красится тёмно-синим и его не
-    # отличить от слабого сигнала в толще воды (выглядит как разрыв/дыра).
-    target_y = np.linspace(0.0, max_depth, rows)
     arr = np.zeros((rows, len(records)), dtype=np.uint8)
     valid = np.zeros((rows, len(records)), dtype=bool)
-    for col, (r, d) in enumerate(zip(records, depth_anchor)):
-        if r and d > 0:
-            src = np.frombuffer(r, dtype=np.uint8).astype(np.float32)
-            src_depth = np.linspace(0.0, d, len(src))
-            arr[:, col] = np.interp(target_y, src_depth, src, left=0.0, right=0.0)
-            valid[:, col] = target_y <= d
+    for col, r in enumerate(records):
+        if r:
+            n = len(r)
+            arr[:n, col] = np.frombuffer(r, dtype=np.uint8)
+            valid[:n, col] = True
     return arr, valid
 
 
@@ -564,6 +543,127 @@ def merge_gnss_tracks(gnss_paths):
     return {k: v[order] for k, v in merged.items()}
 
 
+def compute_isobaths(lat, lon, depth, waterline_points, cell, interval):
+    """Грид глубин (линейная интерполяция) + линии постоянной глубины через
+    matplotlib.contour. Точки уреза воды (нарисованные вручную, глубина 0)
+    подмешиваются к данным эхолота — это стандартный приём в батиметрии:
+    сонар не измеряет вплотную к берегу, а урез задаёт границу 0 м."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    lat_arr = np.array(list(lat) + [p[0] for p in waterline_points])
+    lon_arr = np.array(list(lon) + [p[1] for p in waterline_points])
+    depth_arr = np.array(list(depth) + [0.0] * len(waterline_points))
+
+    crs, fwd, inv = make_proj(float(np.median(lon_arr)), float(np.median(lat_arr)))
+    E, N = fwd.transform(lon_arr, lat_arr)
+
+    x0, y0 = float(E.min()), float(N.min())
+    nx = max(2, int((E.max() - x0) / cell) + 1)
+    ny = max(2, int((N.max() - y0) / cell) + 1)
+    if nx * ny > 4_000_000:
+        raise ValueError("Слишком мелкая ячейка сетки для такой площади — увеличьте шаг")
+    xs = x0 + np.arange(nx) * cell
+    ys = y0 + np.arange(ny) * cell
+    GX, GY = np.meshgrid(xs, ys)
+    Z = griddata((E, N), depth_arr, (GX, GY), method="linear")
+    if np.all(np.isnan(Z)):
+        raise ValueError("Не удалось построить сетку — проверьте данные")
+
+    zmin, zmax = float(np.nanmin(Z)), float(np.nanmax(Z))
+    start = np.ceil(zmin / interval) * interval
+    levels = np.arange(start, zmax, interval)
+    if len(levels) == 0:
+        raise ValueError("Нет подходящих уровней изобат — измените шаг")
+
+    fig, ax = plt.subplots()
+    cs = ax.contour(GX, GY, np.ma.masked_invalid(Z), levels=levels)
+    contours = []
+    for level, segs in zip(cs.levels, cs.allsegs):
+        for seg in segs:
+            if len(seg) < 2:
+                continue
+            lon_c, lat_c = inv.transform(seg[:, 0], seg[:, 1])
+            contours.append(dict(level=float(level),
+                                  coords=[[float(la), float(lo)] for la, lo in zip(lat_c, lon_c)]))
+    plt.close(fig)
+    return contours
+
+
+def build_isobaths_map_html(basemap, lat, lon):
+    tile = BASEMAPS[basemap]
+    center = [sum(lat) / len(lat), sum(lon) / len(lon)] if lat else [0, 0]
+    pts = list(zip(lat, lon))
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+<style>html,body,#map{{height:100%;margin:0}}
+.iso-tip{{background:#222;color:#fff;border:none;font:11px sans-serif}}</style>
+</head><body>
+<div id="map"></div>
+<script>
+var map = L.map('map', {{preferCanvas: true, attributionControl: false}}).setView([{center[0]}, {center[1]}], 15);
+L.tileLayer('{tile["url"]}', {{maxZoom: {tile["max_zoom"]}}}).addTo(map);
+var pts = {json.dumps(pts)};
+var ptsLayer = L.featureGroup();
+pts.forEach(function (p) {{
+  L.circleMarker([p[0], p[1]], {{radius: 2, weight: 0, fillColor: '#888', fillOpacity: 0.6}}).addTo(ptsLayer);
+}});
+ptsLayer.addTo(map);
+if (pts.length) {{ map.fitBounds(ptsLayer.getBounds()); }}
+
+var drawMode = false;
+var waterline = [];
+var waterlineLine = L.polyline([], {{color: 'red', weight: 3}}).addTo(map);
+var waterlineMarkers = L.layerGroup().addTo(map);
+
+function setDrawMode(v) {{ drawMode = v; }}
+function clearWaterline() {{
+  waterline = [];
+  waterlineLine.setLatLngs([]);
+  waterlineMarkers.clearLayers();
+}}
+
+var bridge = null;
+new QWebChannel(qt.webChannelTransport, function (channel) {{ bridge = channel.objects.bridge; }});
+
+map.on('click', function (e) {{
+  if (!drawMode) {{ return; }}
+  waterline.push([e.latlng.lat, e.latlng.lng]);
+  waterlineLine.setLatLngs(waterline);
+  L.circleMarker(e.latlng, {{radius: 3, color: 'red', fillColor: 'red', fillOpacity: 1}}).addTo(waterlineMarkers);
+  if (bridge) {{ bridge.mapClicked(e.latlng.lat, e.latlng.lng); }}
+}});
+
+var isobathsLayer = L.layerGroup().addTo(map);
+function drawIsobaths(data) {{
+  isobathsLayer.clearLayers();
+  data.forEach(function (c) {{
+    var line = L.polyline(c.coords, {{color: c.color, weight: 2}});
+    line.bindTooltip(c.level.toFixed(1) + ' м', {{className: 'iso-tip'}});
+    line.addTo(isobathsLayer);
+  }});
+}}
+</script>
+</body></html>"""
+
+
+def build_isobaths_js(contours):
+    if not contours:
+        return "drawIsobaths([]);"
+    levels = [c["level"] for c in contours]
+    lo, hi = min(levels), max(levels)
+    data = []
+    for c in contours:
+        t = (c["level"] - lo) / (hi - lo) if hi > lo else 0.0
+        color = f"hsl({int(220 - 220 * t)},80%,55%)"
+        data.append(dict(level=c["level"], coords=c["coords"], color=color))
+    return f"drawIsobaths({json.dumps(data)});"
+
+
 def compute_time_offset(sl2_path, gnss_paths):
     if isinstance(gnss_paths, str):
         gnss_paths = [gnss_paths]
@@ -592,21 +692,25 @@ def compute_time_offset(sl2_path, gnss_paths):
 
 
 class DepthRulerWidget(QWidget):
-    """Линейка глубин слева от эхограммы — отдельный виджет вне области
-    горизонтальной прокрутки, чтобы не уезжать вместе с картинкой. По вертикали
-    синхронизируется со скроллом канваса (see EchogramViewDialog)."""
+    """Линейка слева от эхограммы — отдельный виджет вне области горизонтальной
+    прокрутки, чтобы не уезжать вместе с картинкой. По вертикали синхронизируется
+    со скроллом канваса (see EchogramViewDialog).
+
+    Показывает номер байта от начала пинга, а не глубину в метрах: реальный
+    диапазон сонара на байт неизвестен (см. build_echogram_image), выдавать
+    здесь метры значило бы обманывать точностью, которой на самом деле нет."""
     WIDTH = 55
 
     def __init__(self, canvas):
         super().__init__()
         self.canvas = canvas
         self.setFixedWidth(self.WIDTH)
-        self.max_depth = 0.0
+        self.row_count = 0
         self.content_height = 0
         self.scroll_y = 0
 
-    def set_params(self, max_depth, content_height):
-        self.max_depth = max_depth
+    def set_params(self, row_count, content_height):
+        self.row_count = row_count
         self.content_height = content_height
         self.update()
 
@@ -627,17 +731,76 @@ class DepthRulerWidget(QWidget):
             y_content = self.scroll_y + y_viewport
             if y_content > self.content_height:
                 continue
-            depth = (y_content / self.content_height) * self.max_depth
+            row = (y_content / self.content_height) * self.row_count
             painter.drawLine(self.WIDTH - 5, int(y_viewport), self.WIDTH, int(y_viewport))
-            painter.drawText(2, min(int(y_viewport) + 4, h - 2), f"{depth:.1f}")
+            painter.drawText(2, min(int(y_viewport) + 4, h - 2), f"{row:.0f}")
 
     def wheelEvent(self, event):
         self.canvas.wheelEvent(event)
 
 
+class EchoTimelineWidget(QWidget):
+    """Профиль глубины дна (по данным сонара, depth_m — единственное здесь
+    откалиброванное значение) под эхограммой. По горизонтали синхронизирован
+    со скроллом канваса, как линейка — по вертикали."""
+    HEIGHT = 60
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(self.HEIGHT)
+        self.depth_m = []
+        self.content_width = 0
+        self.scroll_x = 0
+        self.hover_col = None
+
+    def set_params(self, depth_m, content_width):
+        self.depth_m = depth_m
+        self.content_width = content_width
+        self.update()
+
+    def set_scroll_offset(self, x):
+        self.scroll_x = x
+        self.update()
+
+    def set_hover_col(self, col):
+        self.hover_col = col
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#151515"))
+        n = len(self.depth_m)
+        if n < 2 or self.content_width <= 0:
+            return
+        w, h = self.width(), self.height()
+        dmin, dmax = min(self.depth_m), max(self.depth_m)
+        if dmax <= dmin:
+            dmax = dmin + 1e-6
+        per_ping = self.content_width / n
+        i0 = max(0, int(self.scroll_x / per_ping) - 1)
+        i1 = min(n, int((self.scroll_x + w) / per_ping) + 2)
+        painter.setPen(QColor("#3388ff"))
+        prev = None
+        for i in range(i0, i1):
+            x = i * per_ping - self.scroll_x
+            t = (self.depth_m[i] - dmin) / (dmax - dmin)
+            y = 4 + t * (h - 8)
+            if prev is not None:
+                painter.drawLine(int(prev[0]), int(prev[1]), int(x), int(y))
+            prev = (x, y)
+        if self.hover_col is not None and 0 <= self.hover_col < n:
+            x = self.hover_col * per_ping - self.scroll_x
+            painter.setPen(QColor(255, 255, 0, 200))
+            painter.drawLine(int(x), 0, int(x), h)
+            painter.setPen(QColor("white"))
+            painter.drawText(min(w - 60, max(2, int(x) + 4)), 13,
+                              f"{self.depth_m[self.hover_col]:.2f} м")
+
+
 class EchogramCanvas(QWidget):
     AXIS_H = 22
     zoom_changed = Signal()
+    hover_changed = Signal(object)  # индекс пинга под курсором, либо None
 
     def __init__(self):
         super().__init__()
@@ -649,6 +812,7 @@ class EchogramCanvas(QWidget):
         self.axis_mode = "time"
         self.zoom = 1.0
         self.contrast = 1.0
+        self.hover_pos = None
         self.setMouseTracking(True)
 
     def set_data(self, arr, valid, depth_m, axis_vals, axis_mode):
@@ -690,6 +854,45 @@ class EchogramCanvas(QWidget):
         h = int(self.image.height() * self.zoom)
         painter.drawImage(QRect(0, 0, w, h), self.image)
         self._draw_axis(painter, w, h)
+        if self.hover_pos is not None:
+            self._draw_crosshair(painter, w, h)
+
+    def _draw_crosshair(self, painter, w, h):
+        x, y = self.hover_pos
+        if not (0 <= x <= w and 0 <= y <= h):
+            return
+        painter.setPen(QColor(255, 255, 0, 200))
+        painter.drawLine(0, int(y), w, int(y))
+        painter.drawLine(int(x), 0, int(x), h)
+        row = y / h * self.image.height() if h else 0
+        col = int(x / w * len(self.axis_vals)) if w and self.axis_vals else 0
+        col = max(0, min(len(self.axis_vals) - 1, col)) if self.axis_vals else 0
+        row_label = f"{row:.0f}"
+        col_label = format_axis_label(self.axis_vals[col], self.axis_mode) if self.axis_vals else ""
+        painter.setBrush(QColor(255, 255, 0, 220))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRect(2, max(0, int(y) - 14), 34, 14)
+        painter.drawRect(min(w - 46, int(x) + 2), 2, 44, 14)
+        painter.setPen(QColor("black"))
+        painter.drawText(4, max(11, int(y) - 3), row_label)
+        painter.drawText(min(w - 44, int(x) + 4), 13, col_label)
+
+    def mouseMoveEvent(self, event):
+        if self.image is None:
+            return
+        pos = event.position() if hasattr(event, "position") else event.pos()
+        self.hover_pos = (pos.x(), pos.y())
+        w = int(self.image.width() * self.zoom)
+        col = int(pos.x() / w * len(self.axis_vals)) if w and self.axis_vals else None
+        if col is not None:
+            col = max(0, min(len(self.axis_vals) - 1, col))
+        self.hover_changed.emit(col)
+        self.update()
+
+    def leaveEvent(self, event):
+        self.hover_pos = None
+        self.hover_changed.emit(None)
+        self.update()
 
     def _draw_axis(self, painter, w, h):
         painter.setPen(QColor("#ccc"))
@@ -725,7 +928,7 @@ class EchogramViewDialog(QDialog):
 
         self.status_label = QLabel("Чтение файла…")
         self.canvas = EchogramCanvas()
-        self.canvas.zoom_changed.connect(self.sync_ruler)
+        self.canvas.zoom_changed.connect(self.sync_side_widgets)
         self.ruler = DepthRulerWidget(self.canvas)
         scroll = QScrollArea()
         scroll.setWidget(self.canvas)
@@ -735,6 +938,13 @@ class EchogramViewDialog(QDialog):
         content_row = QHBoxLayout()
         content_row.addWidget(self.ruler)
         content_row.addWidget(scroll, 1)
+
+        self.echo_timeline = EchoTimelineWidget()
+        self.canvas.hover_changed.connect(self.echo_timeline.set_hover_col)
+        scroll.horizontalScrollBar().valueChanged.connect(self.echo_timeline.set_scroll_offset)
+        timeline_row = QHBoxLayout()
+        timeline_row.addSpacing(DepthRulerWidget.WIDTH)
+        timeline_row.addWidget(self.echo_timeline, 1)
 
         self.contrast_slider = QSlider(Qt.Orientation.Horizontal)
         self.contrast_slider.setRange(20, 400)
@@ -748,18 +958,21 @@ class EchogramViewDialog(QDialog):
         layout = QVBoxLayout()
         layout.addWidget(self.status_label)
         layout.addLayout(content_row, 1)
+        layout.addLayout(timeline_row)
         layout.addLayout(contrast_row)
         self.setLayout(layout)
 
         run_async(lambda: read_echogram_waterfall(sl2_path),
                   on_finished=self.on_loaded, on_error=self.on_error)
 
-    def sync_ruler(self):
+    def sync_side_widgets(self):
         if self.canvas.image is None:
             return
-        max_depth = max(self.canvas.depth_m) if self.canvas.depth_m else 0.0
+        row_count = self.canvas.image.height()
         content_height = int(self.canvas.image.height() * self.canvas.zoom)
-        self.ruler.set_params(max_depth, content_height)
+        self.ruler.set_params(row_count, content_height)
+        content_width = int(self.canvas.image.width() * self.canvas.zoom)
+        self.echo_timeline.set_params(self.canvas.depth_m, content_width)
 
     def on_loaded(self, data):
         arr, valid = build_echogram_image(data["records"], data["depth_m"])
@@ -774,10 +987,129 @@ class EchogramViewDialog(QDialog):
                                    f"(колесо мыши — масштаб){note}")
         axis_vals = data["dist"] if self.axis_mode == "distance" else data["t_rel"]
         self.canvas.set_data(arr, valid, data["depth_m"], axis_vals, self.axis_mode)
-        self.sync_ruler()
+        self.sync_side_widgets()
 
     def on_error(self, message):
         self.status_label.setText(f"Ошибка чтения: {message}")
+
+
+class MapClickBridge(QObject):
+    """Мост QWebChannel: клик по карте в JS вызывает mapClicked прямо в
+    Python (тот же поток, без QThread — сюда правило про сигналы между
+    потоками и QWebEngineView не относится)."""
+
+    def __init__(self, on_click):
+        super().__init__()
+        self.on_click = on_click
+
+    @Slot(float, float)
+    def mapClicked(self, lat, lon):
+        self.on_click(lat, lon)
+
+
+class IsobathsDialog(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Построение изобат")
+        self.resize(1100, 700)
+        self.main_window = parent
+        self.waterline_points = []
+
+        self.bridge = MapClickBridge(self.on_map_clicked)
+        self.channel = QWebChannel()
+        self.channel.registerObject("bridge", self.bridge)
+        self.map_view = new_map_view()
+        self.map_view.page().setWebChannel(self.channel)
+
+        points = self.main_window.points or {}
+        html = build_isobaths_map_html(self.main_window.basemap_combo.currentText(),
+                                        points.get("lat", []), points.get("lon", []))
+        load_html(self.map_view, html, "isobaths")
+
+        self.interval_spin = QDoubleSpinBox()
+        self.interval_spin.setRange(0.1, 100.0)
+        self.interval_spin.setValue(1.0)
+        self.interval_spin.setSuffix(" м")
+        interval_row = QHBoxLayout()
+        interval_row.addWidget(QLabel("Шаг изобат:"))
+        interval_row.addWidget(self.interval_spin)
+
+        self.cell_spin = QDoubleSpinBox()
+        self.cell_spin.setRange(0.1, 1000.0)
+        self.cell_spin.setValue(1.0)
+        self.cell_spin.setSuffix(" м")
+        cell_row = QHBoxLayout()
+        cell_row.addWidget(QLabel("Ячейка сетки:"))
+        cell_row.addWidget(self.cell_spin)
+
+        self.draw_btn = QPushButton("Нарисовать урез воды")
+        self.draw_btn.setCheckable(True)
+        self.draw_btn.toggled.connect(self.on_draw_toggled)
+
+        clear_waterline_btn = QPushButton("Очистить урез")
+        clear_waterline_btn.clicked.connect(self.clear_waterline)
+
+        self.waterline_label = QLabel("Точек уреза: 0")
+
+        settings_layout = QVBoxLayout()
+        settings_layout.addLayout(interval_row)
+        settings_layout.addLayout(cell_row)
+        settings_layout.addWidget(self.draw_btn)
+        settings_layout.addWidget(clear_waterline_btn)
+        settings_layout.addWidget(self.waterline_label)
+        settings_layout.addStretch(1)
+        settings_widget = QWidget()
+        settings_widget.setLayout(settings_layout)
+        settings_widget.setFixedWidth(220)
+
+        content_row = QHBoxLayout()
+        content_row.addWidget(settings_widget)
+        content_row.addWidget(self.map_view, 1)
+
+        self.status_label = QLabel("")
+        build_btn = QPushButton("Построить")
+        build_btn.clicked.connect(self.build_isobaths)
+
+        layout = QVBoxLayout()
+        layout.addLayout(content_row, 1)
+        layout.addWidget(self.status_label)
+        layout.addWidget(build_btn)
+        self.setLayout(layout)
+
+    def on_draw_toggled(self, checked):
+        self.draw_btn.setText("Рисование уреза: кликните по карте (ещё раз — выкл)"
+                               if checked else "Нарисовать урез воды")
+        self.map_view.page().runJavaScript(f"setDrawMode({'true' if checked else 'false'});")
+
+    def on_map_clicked(self, lat, lon):
+        if not self.draw_btn.isChecked():
+            return
+        self.waterline_points.append((lat, lon))
+        self.waterline_label.setText(f"Точек уреза: {len(self.waterline_points)}")
+
+    def clear_waterline(self):
+        self.waterline_points = []
+        self.waterline_label.setText("Точек уреза: 0")
+        self.map_view.page().runJavaScript("clearWaterline();")
+
+    def build_isobaths(self):
+        points = self.main_window.points or {}
+        lat, lon, depth = points.get("lat", []), points.get("lon", []), points.get("value", [])
+        if len(lat) < 10:
+            QMessageBox.information(self, "Изобаты",
+                                     "Недостаточно точек — сначала загрузите эхограмму.")
+            return
+        self.status_label.setText("Строю изобаты…")
+        run_async(lambda: compute_isobaths(lat, lon, depth, list(self.waterline_points),
+                                            self.cell_spin.value(), self.interval_spin.value()),
+                  on_finished=self.on_built, on_error=self.on_build_error)
+
+    def on_built(self, contours):
+        self.status_label.setText(f"Построено изобат: {len(contours)}")
+        self.map_view.page().runJavaScript(build_isobaths_js(contours))
+
+    def on_build_error(self, message):
+        self.status_label.setText(f"Ошибка: {message}")
 
 
 class OffsetDialog(QDialog):
@@ -962,7 +1294,7 @@ class DepthOffsetDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ОМДЖЕТ Гидро")
+        self.setWindowTitle(f"ОМДЖЕТ Гидро {APP_VERSION}")
         self.setWindowIcon(QIcon(ICON_PATH))
         self.resize(1100, 800)
         self.settings = QSettings("sl2sync", "gui")
@@ -1021,6 +1353,15 @@ class MainWindow(QMainWindow):
         row2.addWidget(multi_gnss_btn)
         row2.addWidget(sep2b)
         row2.addWidget(close_gnss_btn)
+
+        sep_hline = QFrame()
+        sep_hline.setFrameShape(QFrame.Shape.HLine)
+        sep_hline.setFrameShadow(QFrame.Shadow.Sunken)
+        isobaths_btn = QPushButton("Построить изобаты")
+        isobaths_btn.clicked.connect(self.open_isobaths)
+        row_isobaths = QHBoxLayout()
+        row_isobaths.addStretch(1)
+        row_isobaths.addWidget(isobaths_btn)
 
         self.offset_btn = QPushButton("Рассчитать смещение")
         self.offset_btn.setEnabled(False)
@@ -1157,6 +1498,8 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout()
         layout.addLayout(row1)
         layout.addLayout(row2)
+        layout.addWidget(sep_hline)
+        layout.addLayout(row_isobaths)
         layout.addLayout(row_offset)
         layout.addLayout(maps_row, 1)
         layout.addLayout(row3)
@@ -1413,6 +1756,10 @@ class MainWindow(QMainWindow):
         dlg = SettingsDialog(self, self.settings)
         if dlg.exec():
             self.redraw_map()
+
+    def open_isobaths(self):
+        dlg = IsobathsDialog(self)
+        dlg.exec()
 
     def check_for_updates(self, silent=False):
         run_async(fetch_latest_release,
