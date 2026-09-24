@@ -106,9 +106,12 @@ def build_map_html(basemap, points, color_by_depth=True, vmin=None, vmax=None, s
 .depth-legend{{background:rgba(20,20,20,.65);color:#fff;padding:8px;border-radius:4px;
                font:12px sans-serif;box-shadow:0 1px 4px rgba(0,0,0,.4);
                display:flex;flex-direction:column;align-items:center}}
+.depth-legend .bar-wrap{{position:relative;width:12px;height:120px}}
 .depth-legend .bar{{width:12px;height:120px;
                background:linear-gradient(to top, rgb(128,0,0), rgb(255,0,0), rgb(255,255,0),
                rgb(0,255,255), rgb(0,0,255), rgb(0,0,143))}}
+.depth-legend .tick{{position:absolute;left:0;width:12px;height:1px;
+               background:rgba(0,0,0,.55)}}
 .depth-legend .scale{{display:flex;flex-direction:column;justify-content:space-between;
                height:120px;text-align:center}}
 .depth-legend .row{{display:flex;align-items:stretch}}
@@ -255,10 +258,17 @@ if (data.features.length) {{
     var legend = L.control({{position: 'bottomright'}});
     legend.onAdd = function () {{
       var div = L.DomUtil.create('div', 'depth-legend');
+      var nTicks = 5;
+      var barHtml = '<div class="bar-wrap"><div class="bar"></div>';
+      var scaleHtml = '<div class="scale">';
+      for (var k = 0; k <= nTicks; k++) {{
+        barHtml += '<div class="tick" style="top:' + (k / nTicks * 100) + '%"></div>';
+        scaleHtml += '<span>' + (vmax - (vmax - vmin) * (k / nTicks)).toFixed(1) + '</span>';
+      }}
+      barHtml += '</div>';
+      scaleHtml += '</div>';
       div.innerHTML = '<div>' + {json.dumps(legend_title)} + '</div><div class="row">' +
-        '<div class="bar"></div>' +
-        '<div class="scale"><span>' + vmax.toFixed(1) + '</span><span>' + vmin.toFixed(1) + '</span></div>' +
-        '</div>';
+        barHtml + scaleHtml + '</div>';
       return div;
     }};
     legend.addTo(map);
@@ -1359,9 +1369,9 @@ class MainWindow(QMainWindow):
         sep_hline.setFrameShadow(QFrame.Shadow.Sunken)
         isobaths_btn = QPushButton("Построить изобаты")
         isobaths_btn.clicked.connect(self.open_isobaths)
-        row_isobaths = QHBoxLayout()
-        row_isobaths.addStretch(1)
-        row_isobaths.addWidget(isobaths_btn)
+        sep_iso = QFrame()
+        sep_iso.setFrameShape(QFrame.Shape.VLine)
+        sep_iso.setFrameShadow(QFrame.Shadow.Sunken)
 
         self.offset_btn = QPushButton("Рассчитать смещение")
         self.offset_btn.setEnabled(False)
@@ -1372,6 +1382,8 @@ class MainWindow(QMainWindow):
         settings_btn = QPushButton("Настройки")
         settings_btn.clicked.connect(self.open_settings)
         row_offset = QHBoxLayout()
+        row_offset.addWidget(isobaths_btn)
+        row_offset.addWidget(sep_iso)
         row_offset.addStretch(1)
         row_offset.addWidget(self.offset_btn)
         row_offset.addWidget(sep2)
@@ -1392,11 +1404,9 @@ class MainWindow(QMainWindow):
         self.crop_end_time_spin = QDoubleSpinBox()
         self.crop_end_time_spin.setRange(0.0, 1_000_000.0)
         self.crop_end_time_spin.setSuffix(" с")
-        time_row = QHBoxLayout()
-        time_row.addWidget(QLabel("С начала:"))
-        time_row.addWidget(self.crop_start_time_spin)
-        time_row.addWidget(QLabel("С конца:"))
-        time_row.addWidget(self.crop_end_time_spin)
+        time_row = QFormLayout()
+        time_row.addRow("С начала:", self.crop_start_time_spin)
+        time_row.addRow("С конца:", self.crop_end_time_spin)
 
         self.crop_start_dist_spin = QDoubleSpinBox()
         self.crop_start_dist_spin.setRange(0.0, 1_000_000.0)
@@ -1404,11 +1414,9 @@ class MainWindow(QMainWindow):
         self.crop_end_dist_spin = QDoubleSpinBox()
         self.crop_end_dist_spin.setRange(0.0, 1_000_000.0)
         self.crop_end_dist_spin.setSuffix(" м")
-        dist_row = QHBoxLayout()
-        dist_row.addWidget(QLabel("С начала:"))
-        dist_row.addWidget(self.crop_start_dist_spin)
-        dist_row.addWidget(QLabel("С конца:"))
-        dist_row.addWidget(self.crop_end_dist_spin)
+        dist_row = QFormLayout()
+        dist_row.addRow("С начала:", self.crop_start_dist_spin)
+        dist_row.addRow("С конца:", self.crop_end_dist_spin)
 
         for spin in (self.crop_start_time_spin, self.crop_end_time_spin,
                      self.crop_start_dist_spin, self.crop_end_dist_spin):
@@ -1452,17 +1460,16 @@ class MainWindow(QMainWindow):
         depth_box.setLayout(depth_form)
 
         date_box = QGroupBox("Дата")
-        self.start_label = QLabel("—")
-        self.start_label.setWordWrap(True)
-        self.end_label = QLabel("—")
-        self.end_label.setWordWrap(True)
-        self.duration_label = QLabel("—")
-        self.duration_label.setWordWrap(True)
-        date_form = QFormLayout()
-        date_form.addRow("Начало:", self.start_label)
-        date_form.addRow("Конец:", self.end_label)
-        date_form.addRow("Продолжительность:", self.duration_label)
-        date_box.setLayout(date_form)
+        self.start_label = QLabel("Начало: —")
+        self.end_label = QLabel("Конец: —")
+        self.duration_label = QLabel("Продолжительность: —")
+        for lbl in (self.start_label, self.end_label, self.duration_label):
+            lbl.setWordWrap(True)
+        date_layout = QVBoxLayout()
+        date_layout.addWidget(self.start_label)
+        date_layout.addWidget(self.end_label)
+        date_layout.addWidget(self.duration_label)
+        date_box.setLayout(date_layout)
 
         summary_layout = QVBoxLayout()
         summary_layout.addWidget(depth_box)
@@ -1489,7 +1496,7 @@ class MainWindow(QMainWindow):
         left_col.addStretch(1)
         left_widget = QWidget()
         left_widget.setLayout(left_col)
-        left_widget.setFixedWidth(230)
+        left_widget.setFixedWidth(260)
 
         maps_row = QHBoxLayout()
         maps_row.addWidget(left_widget)
@@ -1499,7 +1506,6 @@ class MainWindow(QMainWindow):
         layout.addLayout(row1)
         layout.addLayout(row2)
         layout.addWidget(sep_hline)
-        layout.addLayout(row_isobaths)
         layout.addLayout(row_offset)
         layout.addLayout(maps_row, 1)
         layout.addLayout(row3)
@@ -1718,13 +1724,15 @@ class MainWindow(QMainWindow):
 
         start, end, duration_s = points.get("start"), points.get("end"), points.get("duration_s")
         if start and end and duration_s is not None:
-            self.start_label.setText(datetime.fromisoformat(start).strftime("%d.%m.%Y %H:%M:%S"))
-            self.end_label.setText(datetime.fromisoformat(end).strftime("%d.%m.%Y %H:%M:%S"))
-            self.duration_label.setText(str(timedelta(seconds=int(duration_s))))
+            start_str = datetime.fromisoformat(start).strftime("%d.%m.%Y %H:%M:%S")
+            end_str = datetime.fromisoformat(end).strftime("%d.%m.%Y %H:%M:%S")
+            self.start_label.setText(f"Начало: {start_str}")
+            self.end_label.setText(f"Конец: {end_str}")
+            self.duration_label.setText(f"Продолжительность: {timedelta(seconds=int(duration_s))}")
         else:
-            self.start_label.setText("—")
-            self.end_label.setText("—")
-            self.duration_label.setText("—")
+            self.start_label.setText("Начало: —")
+            self.end_label.setText("Конец: —")
+            self.duration_label.setText("Продолжительность: —")
 
     def on_echogram_error(self, message):
         self.statusBar().showMessage("Ошибка чтения файла")
