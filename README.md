@@ -210,6 +210,15 @@ GUI-изобаты — для быстрого визуального контр
   релиза. При запуске программы такая проверка выполняется автоматически и тихо
   (без окон, если обновлений нет).
 
+### Сборка EXE (Windows)
+    pip install pyinstaller
+    pyinstaller OMJET_Gidro.spec
+
+Готовый `dist/OMJET_Gidro.exe` — однофайловая сборка (~280 МБ, PySide6 с
+QtWebEngine занимает большую часть размера), без установки Python. Собранные
+релизы также выкладываются на странице
+[Releases](https://github.com/andrewkena/omjet-gidro/releases).
+
 ### Технические заметки
 - Карта встроена через `QWebEngineView` + Leaflet.js. В этом окружении обнаружено,
   что вызов `QWebEngineView` из обработчика, вызванного через `QThread`-сигнал между

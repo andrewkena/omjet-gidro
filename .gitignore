@@ -24,3 +24,8 @@ examples/data/Sonar_02_Gorodok_2026-05-26_11.09.05.sl2
 
 # журналы фоновых тестовых запусков gui.py
 gui_run*.log
+
+# сборка EXE (PyInstaller) — сам exe прикладывается к релизу на GitHub, не в git
+build/
+dist/
+pyinstaller_build.log
