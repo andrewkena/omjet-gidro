@@ -17,3 +17,10 @@ truth.json
 !examples/data/*.sl3
 !examples/data/*.nmea
 !examples/data/*.pos
+
+# слишком большие для обычного git push (>100 МБ, лимит GitHub) — только локально
+examples/data/Sonar_01_Gorodok_2026-05-26_10.35.05.sl2
+examples/data/Sonar_02_Gorodok_2026-05-26_11.09.05.sl2
+
+# журналы фоновых тестовых запусков gui.py
+gui_run*.log

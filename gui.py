@@ -4,9 +4,11 @@
 Lowrance) поверх выбранной онлайн-подложки, расчёт временного смещения
 относительно GNSS-трека со сравнением треков до/после синхронизации.
 """
+import csv
 import itertools
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -15,6 +17,7 @@ from datetime import datetime, timedelta
 
 import numpy as np
 from scipy.interpolate import griddata
+from scipy.ndimage import gaussian_filter
 from PySide6.QtCore import QObject, QRect, QSettings, QSize, Qt, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QColor, QDesktopServices, QIcon, QImage, QPainter, QPixmap
 from PySide6.QtWebChannel import QWebChannel
@@ -74,20 +77,34 @@ def load_html(view, html, name):
     view.load(QUrl.fromLocalFile(path))
 
 
+OMSK_CENTER = [54.9885, 73.3242]
+
+
 def build_map_html(basemap, points, color_by_depth=True, vmin=None, vmax=None, steps=32,
-                    axis_mode="time", legend_title="Глубина, м", tooltip_suffix=" м"):
+                    axis_mode="time", legend_title="Глубина, м", tooltip_suffix=" м",
+                    depth_vals=None, speed_vals=None, show_endpoints=True,
+                    show_speed_track=False, track_width=3, speed_glow_width=12):
     tile = BASEMAPS[basemap]
     lat, lon, val = points["lat"], points["lon"], points["value"]
     axis_key = "dist" if axis_mode == "distance" else "t_rel"
     axis_vals = points.get(axis_key) or list(range(len(val)))
     if lat:
         center = [sum(lat) / len(lat), sum(lon) / len(lon)]
+        zoom = 15
     else:
-        center = [0, 0]
+        # До загрузки трека — открываем карту на Омске, а не в океане у [0,0].
+        center = OMSK_CENTER
+        zoom = 12
     if vmin is None or vmax is None:
         vmin, vmax = (min(val), max(val)) if val else (0.0, 1.0)
     if vmax <= vmin:
         vmax = vmin + 1e-6
+    depth_vals = list(depth_vals) if depth_vals is not None else list(val)
+    max_depth_idx = depth_vals.index(max(depth_vals)) if depth_vals else -1
+    max_depth_val = float(depth_vals[max_depth_idx]) if max_depth_idx >= 0 else 0.0
+    speed_vals = list(speed_vals) if speed_vals is not None else []
+    max_speed_idx = speed_vals.index(max(speed_vals)) if speed_vals else -1
+    max_speed_val = float(speed_vals[max_speed_idx]) if max_speed_idx >= 0 else 0.0
     geojson = {
         "type": "FeatureCollection",
         "features": [
@@ -115,12 +132,16 @@ def build_map_html(basemap, points, color_by_depth=True, vmin=None, vmax=None, s
 .depth-legend .scale{{display:flex;flex-direction:column;justify-content:space-between;
                height:120px;text-align:center}}
 .depth-legend .row{{display:flex;align-items:stretch}}
-.depth-cursor-tip{{background:#222;color:#fff;border:none;font:12px sans-serif}}</style>
+.depth-cursor-tip{{background:#222;color:#fff;border:none;font:12px sans-serif}}
+.track-flag{{background:transparent;border:none}}
+.max-depth-label,.max-speed-label{{background:transparent;border:none}}
+.max-depth-label span,.max-speed-label span{{background:rgba(0,0,0,.65);color:#fff;padding:1px 4px;
+               border-radius:3px;font:11px sans-serif;white-space:nowrap}}</style>
 </head><body>
 <div id="map"></div>
 <canvas id="timeline"></canvas>
 <script>
-var map = L.map('map', {{preferCanvas: true, attributionControl: false}}).setView([{center[0]}, {center[1]}], 15);
+var map = L.map('map', {{preferCanvas: true, attributionControl: false}}).setView([{center[0]}, {center[1]}], {zoom});
 L.tileLayer('{tile["url"]}', {{
   maxZoom: {tile["max_zoom"]}
 }}).addTo(map);
@@ -154,6 +175,11 @@ function color(v) {{
   t = band / (steps - 1);
   return jetColor(1 - t);
 }}
+var showSpeedTrack = {"true" if show_speed_track else "false"};
+// В режиме «Скорость на треке» точки, окрашенные по глубине/твёрдости, не
+// показываем вовсе — только скорость, без смешения с другой раскраской. Слой
+// всё равно нужен (getBounds() для авто-масштабирования карты), просто не
+// добавляем его на карту.
 var layer = L.geoJSON(data, {{
   pointToLayer: function (f, latlng) {{
     var m = L.circleMarker(latlng, {{radius: 3, weight: 0, fillOpacity: 0.85,
@@ -162,7 +188,114 @@ var layer = L.geoJSON(data, {{
     m.on('mouseover', function () {{ showAtIndex(f.properties.i); }});
     return m;
   }}
-}}).addTo(map);
+}});
+if (!showSpeedTrack) {{ layer.addTo(map); }}
+
+var speedVals = {json.dumps(speed_vals)};
+var trackLineWidth = {int(track_width)};
+var speedGlowWidth = {int(speed_glow_width)};
+var speedMin = 0, speedMax = 1;
+if (speedVals.length) {{
+  speedMin = Math.min.apply(null, speedVals);
+  speedMax = Math.max.apply(null, speedVals);
+}}
+if (speedMax <= speedMin) {{ speedMax = speedMin + 1e-6; }}
+function speedColor(v) {{
+  var t = Math.max(0, Math.min(1, (v - speedMin) / (speedMax - speedMin)));
+  return jetColor(t);
+}}
+// Отдельный pane с z-index ниже слоя точек трека (overlayPane = 400) — свечение
+// скорости всегда рисуется под точками, независимо от порядка добавления слоёв,
+// и выходит за их пределы (перекрывает трек снизу), а не поверх них.
+var speedPane = map.createPane('speedGlowPane');
+speedPane.style.zIndex = 350;
+speedPane.style.pointerEvents = 'none';
+
+var speedTrackLayer = L.layerGroup();
+if (speedVals.length === pts.length && pts.length > 1) {{
+  for (var si = 0; si < pts.length - 1; si++) {{
+    var segCol = speedColor((speedVals[si] + speedVals[si + 1]) / 2);
+    var segCoords = [[pts[si].lat, pts[si].lon], [pts[si + 1].lat, pts[si + 1].lon]];
+    L.polyline(segCoords, {{pane: 'speedGlowPane', color: segCol, weight: speedGlowWidth,
+                             opacity: 0.35, interactive: false}}).addTo(speedTrackLayer);
+    L.polyline(segCoords, {{pane: 'speedGlowPane', color: segCol, weight: trackLineWidth,
+                             opacity: 0.7, interactive: false}}).addTo(speedTrackLayer);
+  }}
+}}
+
+var speedLegend = L.control({{position: 'bottomright'}});
+speedLegend.onAdd = function () {{
+  var div = L.DomUtil.create('div', 'depth-legend');
+  var nTicks = 5;
+  // Полный градиент по тем же опорным точкам, что и jetColor (а не только
+  // min/max) — иначе полоса легенды не показывает голубой/жёлтый переход,
+  // который реально виден на треке для промежуточных скоростей.
+  var speedStops = jetStops.map(function (s) {{
+    return 'rgb(' + s[1][0] + ',' + s[1][1] + ',' + s[1][2] + ')';
+  }}).join(', ');
+  var barHtml = '<div class="bar-wrap"><div class="bar" style="background:' +
+    'linear-gradient(to top, ' + speedStops + ')"></div>';
+  var scaleHtml = '<div class="scale">';
+  for (var k = 0; k <= nTicks; k++) {{
+    barHtml += '<div class="tick" style="top:' + (k / nTicks * 100) + '%"></div>';
+    scaleHtml += '<span>' + (speedMax - (speedMax - speedMin) * (k / nTicks)).toFixed(2) + '</span>';
+  }}
+  barHtml += '</div>';
+  scaleHtml += '</div>';
+  div.innerHTML = '<div>Скорость, м/с</div><div class="row">' + barHtml + scaleHtml + '</div>';
+  return div;
+}};
+var speedLegendAdded = false;
+function setSpeedTrackVisible(v) {{
+  if (v) {{
+    if (!map.hasLayer(speedTrackLayer)) {{ map.addLayer(speedTrackLayer); }}
+    if (!speedLegendAdded) {{ speedLegend.addTo(map); speedLegendAdded = true; }}
+  }} else {{
+    if (map.hasLayer(speedTrackLayer)) {{ map.removeLayer(speedTrackLayer); }}
+    if (speedLegendAdded) {{ speedLegend.remove(); speedLegendAdded = false; }}
+  }}
+}}
+setSpeedTrackVisible(showSpeedTrack);
+
+var showEndpoints = {"true" if show_endpoints else "false"};
+var maxDepthIdx = {max_depth_idx};
+var maxDepthVal = {max_depth_val};
+var maxSpeedIdx = {max_speed_idx};
+var maxSpeedVal = {max_speed_val};
+function flagIcon(color) {{
+  return L.divIcon({{
+    className: 'track-flag', iconSize: [18, 22], iconAnchor: [2, 20],
+    html: '<svg width="18" height="22" viewBox="0 0 18 22">' +
+          '<line x1="2" y1="2" x2="2" y2="20" stroke="#333" stroke-width="2"/>' +
+          '<path d="M2,2 L16,6 L2,10 Z" fill="' + color + '" stroke="#000" stroke-width="0.5"/>' +
+          '</svg>'
+  }});
+}}
+if (showEndpoints && pts.length) {{
+  L.marker([pts[0].lat, pts[0].lon], {{icon: flagIcon('#2ecc40'), interactive: false}}).addTo(map);
+  var lastP = pts[pts.length - 1];
+  L.marker([lastP.lat, lastP.lon], {{icon: flagIcon('#e74c3c'), interactive: false}}).addTo(map);
+  if (maxDepthIdx >= 0 && !showSpeedTrack) {{
+    var mp = pts[maxDepthIdx];
+    L.circleMarker([mp.lat, mp.lon], {{radius: 5, weight: 1, color: '#fff',
+                                        fillColor: '#000', fillOpacity: 1, interactive: false}}).addTo(map);
+    L.marker([mp.lat, mp.lon], {{
+      icon: L.divIcon({{className: 'max-depth-label', iconSize: null, iconAnchor: [-8, 6],
+                        html: '<span>' + maxDepthVal.toFixed(2) + ' м</span>'}}),
+      interactive: false
+    }}).addTo(map);
+  }}
+  if (maxSpeedIdx >= 0) {{
+    var sp = pts[maxSpeedIdx];
+    L.circleMarker([sp.lat, sp.lon], {{radius: 5, weight: 1, color: '#fff',
+                                        fillColor: '#e74c3c', fillOpacity: 1, interactive: false}}).addTo(map);
+    L.marker([sp.lat, sp.lon], {{
+      icon: L.divIcon({{className: 'max-speed-label', iconSize: null, iconAnchor: [-8, 6],
+                        html: '<span>' + maxSpeedVal.toFixed(2) + ' м/с</span>'}}),
+      interactive: false
+    }}).addTo(map);
+  }}
+}}
 
 var cursorMarker = L.circleMarker([0, 0], {{radius: 7, color: '#fff', weight: 2,
                                              fillColor: '#ffd400', fillOpacity: 1}});
@@ -254,7 +387,7 @@ window.addEventListener('resize', function () {{ fitTimelineCanvas(); drawTimeli
 
 if (data.features.length) {{
   map.fitBounds(layer.getBounds(), {{maxZoom: 18}});
-  if (colorByDepth) {{
+  if (colorByDepth && !showSpeedTrack) {{
     var legend = L.control({{position: 'bottomright'}});
     legend.onAdd = function () {{
       var div = L.DomUtil.create('div', 'depth-legend');
@@ -409,15 +542,24 @@ def read_echogram_file(sl2_path):
     lat, lon = s["lat"][m], s["lon"][m]
     t_rel = s["t_rel"][m]
     depth = s["depth_m"][m]
+    speed = s["speed_ms"][m]
     records = [s["echogram"][i] for i in np.where(m)[0]]
     hardness = compute_hardness_index(records, depth.tolist())
     duration_s = info["duration_s"]
-    # sl2 хранит только относительное время (см. docs/CONTEXT.md) — абсолютное
-    # время берём от mtime файла (момент завершения записи) и отсчитываем назад.
-    end_dt = datetime.fromtimestamp(os.path.getmtime(sl2_path))
-    start_dt = end_dt - timedelta(seconds=duration_s)
+    if info.get("start_epoch_utc") is not None:
+        # Настоящее время начала записи из самого файла (поле "unix_s" первого
+        # кадра, см. read_sl2 в sl2sync.py) — надёжнее mtime, который зависит от
+        # того, как файл попал на диск (копирование/перенос с карты памяти может
+        # исказить дату, что и произошло на реальных файлах пользователя).
+        start_dt = datetime.utcfromtimestamp(info["start_epoch_utc"])
+        end_dt = start_dt + timedelta(seconds=duration_s)
+    else:
+        # Резервный вариант, если поле не распознано (например, повреждён первый
+        # кадр) — как раньше, от mtime файла (момент завершения записи) назад.
+        end_dt = datetime.utcfromtimestamp(os.path.getmtime(sl2_path))
+        start_dt = end_dt - timedelta(seconds=duration_s)
     return dict(path=sl2_path, lat=lat.tolist(), lon=lon.tolist(),
-                depth=depth.tolist(), t_rel=t_rel.tolist(),
+                depth=depth.tolist(), t_rel=t_rel.tolist(), speed=speed.tolist(),
                 dist=cumulative_distance(lat, lon), hardness=hardness,
                 start=start_dt.isoformat(), end=end_dt.isoformat(), duration_s=duration_s)
 
@@ -553,12 +695,19 @@ def merge_gnss_tracks(gnss_paths):
     return {k: v[order] for k, v in merged.items()}
 
 
-def compute_isobaths(lat, lon, depth, waterline_points, cell, interval, fill_steps):
+def compute_isobaths(lat, lon, depth, waterline_points, cell, interval, fill_steps, smooth=0.0):
     """Грид глубин (линейная интерполяция) + линии постоянной глубины и залитые
     диапазоны глубин через matplotlib.contour/contourf. Точки уреза воды
     (нарисованные вручную, глубина 0) подмешиваются к данным эхолота — это
     стандартный приём в батиметрии: сонар не измеряет вплотную к берегу,
     а урез задаёт границу 0 м.
+
+    `smooth` — сигма гауссова размытия грида (в ячейках сетки) перед contour/
+    contourf: сглаживает и линии, и заливку одинаково, т.к. обе строятся по
+    одному Zm. 0 — без сглаживания. Перед размытием маскированные (вне выпуклой
+    оболочки промеров) ячейки временно заполняются ближайшим соседом, иначе
+    NaN размывается на соседние ячейки; после размытия исходная маска
+    возвращается.
 
     Упрощение: контуры каждого диапазона заливки отдаются как есть, без
     различения внешних границ и дырок (островов) — для типичной акватории
@@ -585,6 +734,12 @@ def compute_isobaths(lat, lon, depth, waterline_points, cell, interval, fill_ste
     Z = griddata((E, N), depth_arr, (GX, GY), method="linear")
     if np.all(np.isnan(Z)):
         raise ValueError("Не удалось построить сетку — проверьте данные")
+    if smooth and smooth > 0:
+        nan_mask = np.isnan(Z)
+        Zfill = griddata((E, N), depth_arr, (GX, GY), method="nearest")
+        Zs = np.where(nan_mask, Zfill, Z)
+        Zs = gaussian_filter(Zs, sigma=float(smooth))
+        Z = np.where(nan_mask, np.nan, Zs)
     Zm = np.ma.masked_invalid(Z)
 
     zmin, zmax = float(np.nanmin(Z)), float(np.nanmax(Z))
@@ -624,6 +779,45 @@ def compute_isobaths(lat, lon, depth, waterline_points, cell, interval, fill_ste
     return dict(lines=lines, bands=bands, zmin=zmin, zmax=zmax)
 
 
+def read_waterline_points(path):
+    """Читает точки уреза воды из файла: CSV с колонками lat/lon (любой разделитель,
+    как у GNSS-CSV в sl2sync.read_csv_track), либо обычный текст — по два числа
+    (lat, lon) в строке, разделённых запятой/точкой с запятой/пробелом/табом.
+    Строки, которые не удаётся разобрать (заголовок, пустые строки), пропускаются."""
+    with open(path, newline="", errors="ignore") as fh:
+        sample = fh.read(4096)
+        fh.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+            has_header = csv.Sniffer().has_header(sample)
+            rows = list(csv.reader(fh, dialect=dialect))
+        except csv.Error:
+            fh.seek(0)
+            has_header = False
+            rows = [re.split(r"[,;\s]+", line.strip()) for line in fh if line.strip()]
+
+    lat_idx, lon_idx = 0, 1
+    if rows and has_header:
+        header = [c.strip().lower() for c in rows[0]]
+        lat_idx = next((i for i, c in enumerate(header) if "lat" in c), 0)
+        lon_idx = next((i for i, c in enumerate(header) if "lon" in c or "lng" in c), 1)
+        rows = rows[1:]
+
+    points = []
+    for row in rows:
+        if len(row) <= max(lat_idx, lon_idx):
+            continue
+        try:
+            lat = float(row[lat_idx].strip())
+            lon = float(row[lon_idx].strip())
+        except (ValueError, IndexError):
+            continue
+        points.append((lat, lon))
+    if not points:
+        raise ValueError("Не удалось прочитать точки уреза из файла")
+    return points
+
+
 def build_isobaths_map_html(basemap, lat, lon):
     tile = BASEMAPS[basemap]
     center = [sum(lat) / len(lat), sum(lon) / len(lon)] if lat else [0, 0]
@@ -637,7 +831,19 @@ def build_isobaths_map_html(basemap, lat, lon):
 .iso-line-label{{background:rgba(255,255,255,.85);color:#000;padding:0 3px;
                border-radius:2px;white-space:nowrap;font-family:sans-serif;line-height:1.4}}
 .iso-area-label{{background:rgba(0,0,0,.55);color:#fff;padding:1px 5px;
-               border-radius:3px;white-space:nowrap;font-family:sans-serif;line-height:1.4}}</style>
+               border-radius:3px;white-space:nowrap;font-family:sans-serif;line-height:1.4}}
+.iso-area-label-plain{{color:#fff;white-space:nowrap;font-family:sans-serif;line-height:1.4;
+               text-shadow:-1px -1px 2px #000,1px -1px 2px #000,-1px 1px 2px #000,1px 1px 2px #000}}
+.depth-legend{{background:rgba(20,20,20,.65);color:#fff;padding:8px;border-radius:4px;
+               font:12px sans-serif;box-shadow:0 1px 4px rgba(0,0,0,.4);
+               display:flex;flex-direction:column;align-items:center}}
+.depth-legend .bar-wrap{{position:relative;width:12px;height:120px}}
+.depth-legend .bar{{width:12px;height:120px}}
+.depth-legend .tick{{position:absolute;left:0;width:12px;height:1px;
+               background:rgba(0,0,0,.55)}}
+.depth-legend .scale{{display:flex;flex-direction:column;justify-content:space-between;
+               height:120px;text-align:center}}
+.depth-legend .row{{display:flex;align-items:stretch}}</style>
 </head><body>
 <div id="map"></div>
 <script>
@@ -651,6 +857,11 @@ pts.forEach(function (p) {{
 ptsLayer.addTo(map);
 if (pts.length) {{ map.fitBounds(ptsLayer.getBounds()); }}
 
+function setTrackVisible(v) {{
+  if (v) {{ if (!map.hasLayer(ptsLayer)) {{ map.addLayer(ptsLayer); }} }}
+  else {{ if (map.hasLayer(ptsLayer)) {{ map.removeLayer(ptsLayer); }} }}
+}}
+
 var drawMode = false;
 var waterline = [];
 var waterlineLine = L.polyline([], {{color: '#ffa500', weight: 3}}).addTo(map);
@@ -661,6 +872,14 @@ function clearWaterline() {{
   waterline = [];
   waterlineLine.setLatLngs([]);
   waterlineMarkers.clearLayers();
+}}
+function setWaterline(points) {{
+  waterline = points.slice();
+  waterlineLine.setLatLngs(waterline);
+  waterlineMarkers.clearLayers();
+  waterline.forEach(function (p) {{
+    L.circleMarker(p, {{radius: 3, color: '#ffa500', fillColor: '#ffa500', fillOpacity: 1}}).addTo(waterlineMarkers);
+  }});
 }}
 
 var bridge = null;
@@ -684,6 +903,56 @@ function clearIsobaths() {{
   labelsLayer.clearLayers();
 }}
 
+function setLayerVisible(layer, visible) {{
+  if (visible) {{ if (!map.hasLayer(layer)) {{ map.addLayer(layer); }} }}
+  else {{ if (map.hasLayer(layer)) {{ map.removeLayer(layer); }} }}
+}}
+function setLinesVisible(v) {{ setLayerVisible(linesLayer, v); }}
+function setFillVisible(v) {{ setLayerVisible(fillLayer, v); }}
+function setLabelsVisible(v) {{ setLayerVisible(labelsLayer, v); }}
+
+var fillLegend = L.control({{position: 'bottomright'}});
+fillLegend.onAdd = function () {{
+  var div = L.DomUtil.create('div', 'depth-legend');
+  div.id = 'fill-legend-content';
+  return div;
+}};
+var fillLegendAdded = false;
+var lastFillZmin = null, lastFillZmax = null, lastFillColors = [];
+
+function renderFillLegend(zmin, zmax, colors) {{
+  var div = document.getElementById('fill-legend-content');
+  if (!div) {{ return; }}
+  var nTicks = 5;
+  // Градиент строим из реальных цветов диапазонов заливки (а не заново по
+  // hue 220→0) — иначе 2-стопный CSS-градиент интерполируется в RGB и не
+  // совпадает с фактической последовательностью цветов на карте.
+  var stops = (colors && colors.length) ? colors.join(', ') : 'hsl(220,75%,50%), hsl(0,75%,50%)';
+  var barHtml = '<div class="bar-wrap"><div class="bar" style="background:' +
+    'linear-gradient(to top, ' + stops + ')"></div>';
+  var scaleHtml = '<div class="scale">';
+  for (var k = 0; k <= nTicks; k++) {{
+    barHtml += '<div class="tick" style="top:' + (k / nTicks * 100) + '%"></div>';
+    scaleHtml += '<span>' + (zmax - (zmax - zmin) * (k / nTicks)).toFixed(1) + '</span>';
+  }}
+  barHtml += '</div>';
+  scaleHtml += '</div>';
+  div.innerHTML = '<div>Глубина, м</div><div class="row">' + barHtml + scaleHtml + '</div>';
+}}
+
+function setFillLegendVisible(v) {{
+  if (v) {{
+    // onAdd создаёт пустой div — если zmin/zmax уже известны (построение могло
+    // случиться раньше или позже этого вызова), сразу заполняем содержимое,
+    // иначе легенда показывается пустой коробкой.
+    if (!fillLegendAdded) {{ fillLegend.addTo(map); fillLegendAdded = true; }}
+    if (lastFillZmin != null && lastFillZmax != null) {{
+      renderFillLegend(lastFillZmin, lastFillZmax, lastFillColors);
+    }}
+  }}
+  else {{ if (fillLegendAdded) {{ fillLegend.remove(); fillLegendAdded = false; }} }}
+}}
+
 function ringCentroid(rings) {{
   var cx = 0, cy = 0, n = 0;
   rings.forEach(function (ring) {{
@@ -700,41 +969,76 @@ function drawIsobaths(payload) {{
   var labelSize = style.labelSize || 11;
   var labelFreq = Math.max(1, style.labelFreq || 40);
   var fillOpacity = style.fillOpacity != null ? style.fillOpacity : 0.5;
+  var areaLabelClass = style.labelNoBg ? 'iso-area-label-plain' : 'iso-area-label';
+  var lineLabelClass = style.labelNoBg ? 'iso-area-label-plain' : 'iso-line-label';
+
+  // Не повторяем одну и ту же подпись (по тексту), если рядом — в радиусе
+  // 4 высот шрифта на экране — уже стоит подпись с тем же значением: на
+  // извилистых линиях/соседних диапазонах одно и то же число иначе может
+  // напечататься по нескольку раз почти вплотную.
+  var placedLabels = [];
+  function shouldPlaceLabel(text, latlng) {{
+    var pt = map.latLngToLayerPoint(latlng);
+    var minDist = 4 * labelSize;
+    for (var pi = 0; pi < placedLabels.length; pi++) {{
+      if (placedLabels[pi].text === text && pt.distanceTo(placedLabels[pi].pt) < minDist) {{
+        return false;
+      }}
+    }}
+    placedLabels.push({{text: text, pt: pt}});
+    return true;
+  }}
 
   (payload.bands || []).forEach(function (b) {{
-    b.rings.forEach(function (ring) {{
-      if (ring.length < 3) {{ return; }}
-      L.polygon(ring, {{stroke: false, fillColor: b.color, fillOpacity: fillOpacity}}).addTo(fillLayer);
-    }});
-    var c = ringCentroid(b.rings);
+    var validRings = (b.rings || []).filter(function (ring) {{ return ring.length >= 3; }});
+    if (validRings.length) {{
+      // Все кольца диапазона — одной фигурой с правилом заливки evenodd (по умолчанию у
+      // Leaflet Canvas): внешние границы и вложенные «дырки» (где начинается более
+      // глубокий диапазон) корректно вычитаются, а не закрашиваются второй раз поверх —
+      // иначе прозрачность в местах наложения выглядела заметно плотнее, чем на краю.
+      L.polygon(validRings, {{stroke: false, fillColor: b.color, fillOpacity: fillOpacity}}).addTo(fillLayer);
+    }}
+    var c = ringCentroid(validRings);
     if (c) {{
       var text = b.lo.toFixed(1) + '–' + b.hi.toFixed(1) + ' м';
-      L.marker(c, {{
-        icon: L.divIcon({{className: 'iso-area-label', iconSize: null,
-                          html: '<span style="font-size:' + labelSize + 'px">' + text + '</span>'}}),
-        interactive: false
-      }}).addTo(labelsLayer);
+      if (shouldPlaceLabel(text, c)) {{
+        L.marker(c, {{
+          icon: L.divIcon({{className: areaLabelClass, iconSize: null,
+                            html: '<span style="font-size:' + labelSize + 'px">' + text + '</span>'}}),
+          interactive: false
+        }}).addTo(labelsLayer);
+      }}
     }}
   }});
 
   (payload.lines || []).forEach(function (c) {{
     L.polyline(c.coords, {{color: lineColor, weight: lineWidth}}).addTo(linesLayer);
     for (var i = 0; i < c.coords.length; i += labelFreq) {{
-      L.marker(c.coords[i], {{
-        icon: L.divIcon({{className: 'iso-line-label', iconSize: null,
-                          html: '<span style="font-size:' + labelSize + 'px">' +
-                                c.level.toFixed(1) + '</span>'}}),
-        interactive: false
-      }}).addTo(labelsLayer);
+      var text = c.level.toFixed(1);
+      if (shouldPlaceLabel(text, c.coords[i])) {{
+        L.marker(c.coords[i], {{
+          icon: L.divIcon({{className: lineLabelClass, iconSize: null,
+                            html: '<span style="font-size:' + labelSize + 'px">' + text + '</span>'}}),
+          interactive: false
+        }}).addTo(labelsLayer);
+      }}
     }}
   }});
+
+  if (payload.zmin != null && payload.zmax != null) {{
+    lastFillZmin = payload.zmin;
+    lastFillZmax = payload.zmax;
+    lastFillColors = (payload.bands || []).map(function (b) {{ return b.color; }});
+    renderFillLegend(payload.zmin, payload.zmax, lastFillColors);
+  }}
 }}
 </script>
 </body></html>"""
 
 
 def build_isobaths_js(result, style):
-    payload = dict(lines=result.get("lines", []), style=style)
+    payload = dict(lines=result.get("lines", []), style=style,
+                    zmin=result.get("zmin"), zmax=result.get("zmax"))
     bands = result.get("bands", [])
     n = len(bands)
     payload["bands"] = []
@@ -761,8 +1065,16 @@ def compute_time_offset(sl2_path, gnss_paths):
     ok = np.isfinite(E2)
     lon2, lat2 = inv.transform(E2[ok], N2[ok])
     has_gps = s["has_gps"]
+    # t_abs — реальное UTC-время (эпоха GNSS-трека), в отличие от mtime файла
+    # .sl2, которое зависит от часов эхолота/карты памяти и может быть неверным
+    # (см. docs/CONTEXT.md) — раз GNSS-трек всё равно уже загружен и
+    # синхронизирован, отдаём и уточнённые начало/конец записи.
+    start_utc = datetime.utcfromtimestamp(float(t_abs.min()))
+    end_utc = datetime.utcfromtimestamp(float(t_abs.max()))
     return dict(
         offset_s=tm["a"], rms_pos=tm.get("rms_pos"),
+        start=start_utc.isoformat(), end=end_utc.isoformat(),
+        duration_s=(end_utc - start_utc).total_seconds(),
         before=dict(
             sl2=dict(lat=s["lat"][has_gps].tolist(), lon=s["lon"][has_gps].tolist()),
             gnss=dict(lat=g["lat"].tolist(), lon=g["lon"].tolist())),
@@ -1096,7 +1408,7 @@ class IsobathsDialog(QDialog):
         self.main_window = parent
         self.waterline_points = []
         self.last_result = None
-        self.line_color = QColor("#3388ff")
+        self.line_color = QColor("#000000")
 
         self.bridge = MapClickBridge(self.on_map_clicked)
         self.channel = QWebChannel()
@@ -1125,6 +1437,25 @@ class IsobathsDialog(QDialog):
         cell_row.addWidget(QLabel("Ячейка сетки:"))
         cell_row.addWidget(self.cell_spin)
 
+        self.smooth_spin = QDoubleSpinBox()
+        self.smooth_spin.setRange(0.0, 20.0)
+        self.smooth_spin.setSingleStep(0.5)
+        self.smooth_spin.setValue(0.0)
+        self.smooth_spin.setSuffix(" яч.")
+        self.smooth_spin.setToolTip("Сглаживание грида (гауссово размытие в ячейках сетки) "
+                                     "перед построением линий и заливки — 0 значит без сглаживания. "
+                                     "Действует после нажатия «Построить».")
+        smooth_row = QHBoxLayout()
+        smooth_row.addWidget(QLabel("Сглаживание:"))
+        smooth_row.addWidget(self.smooth_spin)
+
+        self.hide_track_btn = QPushButton("Скрыть трек")
+        self.hide_track_btn.setCheckable(True)
+        self.hide_track_btn.toggled.connect(self.on_hide_track_toggled)
+
+        load_waterline_btn = QPushButton("Загрузить урез из файла")
+        load_waterline_btn.clicked.connect(self.load_waterline_from_file)
+
         self.draw_btn = QPushButton("Нарисовать урез воды")
         self.draw_btn.setCheckable(True)
         self.draw_btn.toggled.connect(self.on_draw_toggled)
@@ -1135,9 +1466,14 @@ class IsobathsDialog(QDialog):
         self.waterline_label = QLabel("Точек уреза: 0")
 
         line_group = QGroupBox("Линии изобат")
-        self.line_width_spin = QSpinBox()
-        self.line_width_spin.setRange(1, 10)
-        self.line_width_spin.setValue(2)
+        self.show_lines_check = QCheckBox("Отображать линии")
+        self.show_lines_check.setChecked(True)
+        self.show_lines_check.toggled.connect(self.on_show_lines_toggled)
+        self.line_width_spin = QDoubleSpinBox()
+        self.line_width_spin.setRange(0.25, 10.0)
+        self.line_width_spin.setSingleStep(0.25)
+        self.line_width_spin.setDecimals(2)
+        self.line_width_spin.setValue(1.0)
         self.line_width_spin.valueChanged.connect(self.apply_style)
         line_width_row = QHBoxLayout()
         line_width_row.addWidget(QLabel("Толщина:"))
@@ -1149,11 +1485,15 @@ class IsobathsDialog(QDialog):
         line_color_row.addWidget(QLabel("Цвет:"))
         line_color_row.addWidget(self.line_color_btn)
         line_layout = QVBoxLayout()
+        line_layout.addWidget(self.show_lines_check)
         line_layout.addLayout(line_width_row)
         line_layout.addLayout(line_color_row)
         line_group.setLayout(line_layout)
 
         label_group = QGroupBox("Подписи изобат")
+        self.show_labels_check = QCheckBox("Отображать подписи")
+        self.show_labels_check.setChecked(True)
+        self.show_labels_check.toggled.connect(self.on_show_labels_toggled)
         self.label_size_spin = QSpinBox()
         self.label_size_spin.setRange(6, 30)
         self.label_size_spin.setValue(11)
@@ -1168,14 +1508,22 @@ class IsobathsDialog(QDialog):
         label_freq_row = QHBoxLayout()
         label_freq_row.addWidget(QLabel("Частота (точек):"))
         label_freq_row.addWidget(self.label_freq_spin)
+        self.label_nobg_check = QCheckBox("Только цифры, без фона")
+        self.label_nobg_check.setChecked(False)
+        self.label_nobg_check.toggled.connect(self.apply_style)
         label_layout = QVBoxLayout()
+        label_layout.addWidget(self.show_labels_check)
         label_layout.addLayout(label_size_row)
         label_layout.addLayout(label_freq_row)
         label_layout.addWidget(QLabel("Подписи диапазонов глубин внутри заливки —\n"
                                        "тем же шрифтом, в центре каждой области."))
+        label_layout.addWidget(self.label_nobg_check)
         label_group.setLayout(label_layout)
 
         fill_group = QGroupBox("Заливка изобат")
+        self.show_fill_check = QCheckBox("Отображать заливку")
+        self.show_fill_check.setChecked(True)
+        self.show_fill_check.toggled.connect(self.on_show_fill_toggled)
         self.fill_opacity_spin = QSpinBox()
         self.fill_opacity_spin.setRange(0, 100)
         self.fill_opacity_spin.setValue(50)
@@ -1191,13 +1539,17 @@ class IsobathsDialog(QDialog):
         fill_steps_row.addWidget(QLabel("Ступеней:"))
         fill_steps_row.addWidget(self.fill_steps_spin)
         fill_layout = QVBoxLayout()
+        fill_layout.addWidget(self.show_fill_check)
         fill_layout.addLayout(fill_opacity_row)
         fill_layout.addLayout(fill_steps_row)
         fill_group.setLayout(fill_layout)
 
         settings_layout = QVBoxLayout()
+        settings_layout.addWidget(self.hide_track_btn)
         settings_layout.addLayout(interval_row)
         settings_layout.addLayout(cell_row)
+        settings_layout.addLayout(smooth_row)
+        settings_layout.addWidget(load_waterline_btn)
         settings_layout.addWidget(self.draw_btn)
         settings_layout.addWidget(clear_waterline_btn)
         settings_layout.addWidget(self.waterline_label)
@@ -1261,6 +1613,25 @@ class IsobathsDialog(QDialog):
         self.waterline_label.setText("Точек уреза: 0")
         self.map_view.page().runJavaScript("clearWaterline();")
 
+    def on_hide_track_toggled(self, checked):
+        self.hide_track_btn.setText("Показать трек" if checked else "Скрыть трек")
+        self.map_view.page().runJavaScript(f"setTrackVisible({'false' if checked else 'true'});")
+
+    def load_waterline_from_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Загрузить урез воды", "",
+                                               "Текст/CSV (*.csv *.txt);;Все файлы (*)")
+        if not path:
+            return
+        try:
+            points = read_waterline_points(path)
+        except (ValueError, OSError) as e:
+            QMessageBox.warning(self, "Урез воды", f"Не удалось прочитать файл:\n{e}")
+            return
+        self.waterline_points.extend(points)
+        self.waterline_label.setText(f"Точек уреза: {len(self.waterline_points)}")
+        points_js = json.dumps([[lat, lon] for lat, lon in self.waterline_points])
+        self.map_view.page().runJavaScript(f"setWaterline({points_js});")
+
     def _update_line_color_btn(self):
         self.line_color_btn.setStyleSheet(f"background-color: {self.line_color.name()};")
         self.line_color_btn.setText(self.line_color.name())
@@ -1277,12 +1648,23 @@ class IsobathsDialog(QDialog):
                     lineWidth=self.line_width_spin.value(),
                     labelSize=self.label_size_spin.value(),
                     labelFreq=self.label_freq_spin.value(),
-                    fillOpacity=self.fill_opacity_spin.value() / 100.0)
+                    fillOpacity=self.fill_opacity_spin.value() / 100.0,
+                    labelNoBg=self.label_nobg_check.isChecked())
 
     def apply_style(self, *_args):
         if self.last_result is None:
             return
         self.map_view.page().runJavaScript(build_isobaths_js(self.last_result, self.current_style()))
+
+    def on_show_lines_toggled(self, checked):
+        self.map_view.page().runJavaScript(f"setLinesVisible({'true' if checked else 'false'});")
+
+    def on_show_fill_toggled(self, checked):
+        js = "true" if checked else "false"
+        self.map_view.page().runJavaScript(f"setFillVisible({js}); setFillLegendVisible({js});")
+
+    def on_show_labels_toggled(self, checked):
+        self.map_view.page().runJavaScript(f"setLabelsVisible({'true' if checked else 'false'});")
 
     def build_isobaths(self):
         points = self.main_window.points or {}
@@ -1294,7 +1676,7 @@ class IsobathsDialog(QDialog):
         self.status_label.setText("Строю изобаты…")
         run_async(lambda: compute_isobaths(lat, lon, depth, list(self.waterline_points),
                                             self.cell_spin.value(), self.interval_spin.value(),
-                                            self.fill_steps_spin.value()),
+                                            self.fill_steps_spin.value(), self.smooth_spin.value()),
                   on_finished=self.on_built, on_error=self.on_build_error)
 
     def on_built(self, result):
@@ -1302,11 +1684,14 @@ class IsobathsDialog(QDialog):
         self.status_label.setText(f"Построено изобат: {len(result['lines'])}, "
                                    f"диапазонов заливки: {len(result['bands'])}")
         self.apply_style()
+        self.on_show_lines_toggled(self.show_lines_check.isChecked())
+        self.on_show_fill_toggled(self.show_fill_check.isChecked())
+        self.on_show_labels_toggled(self.show_labels_check.isChecked())
 
     def delete_isobaths(self):
         self.last_result = None
         self.status_label.setText("Изобаты удалены")
-        self.map_view.page().runJavaScript("clearIsobaths();")
+        self.map_view.page().runJavaScript("clearIsobaths(); setFillLegendVisible(false);")
 
     def save_as_image(self):
         path, _ = QFileDialog.getSaveFileName(self, "Сохранить изображение", "", "PNG (*.png)")
@@ -1408,6 +1793,28 @@ class SettingsDialog(QDialog):
         depth_layout.addLayout(steps_row)
         depth_group.setLayout(depth_layout)
 
+        track_group = QGroupBox("Трек")
+        self.track_width_spin = QSpinBox()
+        self.track_width_spin.setRange(1, 20)
+        self.track_width_spin.setSuffix(" px")
+        self.track_width_spin.setValue(int(settings.value("track_line_width", 3)))
+        track_width_row = QHBoxLayout()
+        track_width_row.addWidget(QLabel("Толщина линии трека:"))
+        track_width_row.addWidget(self.track_width_spin)
+
+        self.speed_glow_spin = QSpinBox()
+        self.speed_glow_spin.setRange(1, 60)
+        self.speed_glow_spin.setSuffix(" px")
+        self.speed_glow_spin.setValue(int(settings.value("speed_glow_width", 12)))
+        speed_glow_row = QHBoxLayout()
+        speed_glow_row.addWidget(QLabel("Толщина линии скорости:"))
+        speed_glow_row.addWidget(self.speed_glow_spin)
+
+        track_layout = QVBoxLayout()
+        track_layout.addLayout(track_width_row)
+        track_layout.addLayout(speed_glow_row)
+        track_group.setLayout(track_layout)
+
         axis_group = QGroupBox("Временная шкала")
         self.axis_time_radio = QRadioButton("Время")
         self.axis_dist_radio = QRadioButton("Расстояние")
@@ -1451,6 +1858,7 @@ class SettingsDialog(QDialog):
 
         layout = QVBoxLayout()
         layout.addWidget(depth_group)
+        layout.addWidget(track_group)
         layout.addWidget(axis_group)
         layout.addWidget(cache_group)
         layout.addLayout(update_row)
@@ -1467,6 +1875,8 @@ class SettingsDialog(QDialog):
         self.settings.setValue("depth_min", self.min_spin.value())
         self.settings.setValue("depth_max", self.max_spin.value())
         self.settings.setValue("depth_steps", self.steps_spin.value())
+        self.settings.setValue("track_line_width", self.track_width_spin.value())
+        self.settings.setValue("speed_glow_width", self.speed_glow_spin.value())
         self.settings.setValue("timeline_axis", "distance" if self.axis_dist_radio.isChecked() else "time")
         cache_mb = self.cache_limit_spin.value()
         self.settings.setValue("cache_max_mb", cache_mb)
@@ -1505,9 +1915,9 @@ class DepthOffsetDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"ОМДЖЕТ Гидро {APP_VERSION}")
+        self.setWindowTitle(f"ОМДЖЕТ Гидро v{APP_VERSION}")
         self.setWindowIcon(QIcon(ICON_PATH))
-        self.resize(1100, 800)
+        self.resize(1100, 1000)
         self.settings = QSettings("sl2sync", "gui")
         QWebEngineProfile.defaultProfile().setHttpCacheMaximumSize(
             int(self.settings.value("cache_max_mb", 1024)) * 1024 * 1024)
@@ -1660,6 +2070,20 @@ class MainWindow(QMainWindow):
         depth_form.addRow("Средняя:", self.avg_depth_label)
         depth_box.setLayout(depth_form)
 
+        speed_box = QGroupBox("Скорость")
+        self.max_speed_label = QLabel("—")
+        self.avg_speed_label = QLabel("—")
+        speed_form = QFormLayout()
+        speed_form.addRow("Макс.:", self.max_speed_label)
+        speed_form.addRow("Средняя:", self.avg_speed_label)
+        speed_box.setLayout(speed_form)
+
+        dist_box = QGroupBox("Расстояние")
+        self.track_length_label = QLabel("—")
+        dist_form = QFormLayout()
+        dist_form.addRow("Протяжённость:", self.track_length_label)
+        dist_box.setLayout(dist_form)
+
         date_box = QGroupBox("Дата")
         self.start_label = QLabel("Начало: —")
         self.end_label = QLabel("Конец: —")
@@ -1673,27 +2097,43 @@ class MainWindow(QMainWindow):
         date_box.setLayout(date_layout)
 
         summary_layout = QVBoxLayout()
-        summary_layout.addWidget(depth_box)
         summary_layout.addWidget(date_box)
+        summary_layout.addWidget(speed_box)
+        summary_layout.addWidget(dist_box)
+        summary_layout.addWidget(depth_box)
         summary_layout.addStretch(1)
         self.summary_panel.setLayout(summary_layout)
 
         self.basemap_combo = QComboBox()
         self.basemap_combo.addItems(BASEMAPS.keys())
         self.basemap_combo.currentTextChanged.connect(self.redraw_map)
+        self.hide_endpoints_check = QCheckBox("Скрыть начало/конец треков")
+        self.hide_endpoints_check.toggled.connect(self.redraw_map)
+        self.show_speed_track_check = QCheckBox("Скорость на треке")
+        self.show_speed_track_check.toggled.connect(self.redraw_map)
         self.color_mode_combo = QComboBox()
         self.color_mode_combo.addItems(["Глубина", "Твёрдость дна", "Нет"])
         self.color_mode_combo.currentTextChanged.connect(self.redraw_map)
+        sep_row3a = QFrame()
+        sep_row3a.setFrameShape(QFrame.Shape.VLine)
+        sep_row3a.setFrameShadow(QFrame.Shadow.Sunken)
+        sep_row3b = QFrame()
+        sep_row3b.setFrameShape(QFrame.Shape.VLine)
+        sep_row3b.setFrameShadow(QFrame.Shadow.Sunken)
         row3 = QHBoxLayout()
         row3.addWidget(QLabel("Фотоподложка:"))
         row3.addWidget(self.basemap_combo, 1)
+        row3.addWidget(sep_row3a)
+        row3.addWidget(self.hide_endpoints_check)
+        row3.addWidget(self.show_speed_track_check)
+        row3.addWidget(sep_row3b)
         row3.addWidget(QLabel("Раскраска:"))
         row3.addWidget(self.color_mode_combo)
 
         left_col = QVBoxLayout()
+        left_col.addWidget(self.summary_panel)
         left_col.addWidget(crop_group)
         left_col.addWidget(offset_group)
-        left_col.addWidget(self.summary_panel)
         left_col.addStretch(1)
         left_widget = QWidget()
         left_widget.setLayout(left_col)
@@ -1831,7 +2271,7 @@ class MainWindow(QMainWindow):
         return (axis - axis[0] >= start_cut) & (axis[-1] - axis >= end_cut)
 
     def combine_and_render(self):
-        lat_all, lon_all, val_all, t_all, dist_all, hard_all = [], [], [], [], [], []
+        lat_all, lon_all, val_all, t_all, dist_all, hard_all, speed_all = [], [], [], [], [], [], []
         t_offset = dist_offset = 0.0
         for f in self.file_data:
             keep = self.crop_mask(f)
@@ -1843,6 +2283,7 @@ class MainWindow(QMainWindow):
             lon_all.extend(np.asarray(f["lon"])[keep].tolist())
             val_all.extend((np.asarray(f["depth"])[keep] + off_m).tolist())
             hard_all.extend(np.asarray(f["hardness"])[keep].tolist())
+            speed_all.extend(np.asarray(f["speed"])[keep].tolist())
             t_all.extend((np.asarray(f["t_rel"])[keep] + t_offset).tolist())
             dist_all.extend((np.asarray(f["dist"])[keep] + dist_offset).tolist())
             # непрерывная ось при нескольких файлах — сдвигаем следующий на длину текущего
@@ -1862,7 +2303,7 @@ class MainWindow(QMainWindow):
             start, end, duration_s = None, None, None
 
         self.points = dict(lat=lat_all, lon=lon_all, value=val_all, hardness=hard_all,
-                            t_rel=t_all, dist=dist_all,
+                            speed=speed_all, t_rel=t_all, dist=dist_all,
                             label=label, start=start, end=end, duration_s=duration_s)
         if lat_all:
             self.statusBar().showMessage(f"Готово: {len(lat_all)} точек, {label}")
@@ -1923,12 +2364,28 @@ class MainWindow(QMainWindow):
             self.min_depth_label.setText("—")
             self.avg_depth_label.setText("—")
 
+        speed = points.get("speed", [])
+        if speed:
+            self.max_speed_label.setText(f"{max(speed):.2f} м/с")
+            self.avg_speed_label.setText(f"{sum(speed) / len(speed):.2f} м/с")
+        else:
+            self.max_speed_label.setText("—")
+            self.avg_speed_label.setText("—")
+
+        dist = points.get("dist", [])
+        if dist:
+            length_m = max(dist) - min(dist)
+            self.track_length_label.setText(
+                f"{length_m / 1000:.2f} км" if length_m >= 1000 else f"{length_m:.0f} м")
+        else:
+            self.track_length_label.setText("—")
+
         start, end, duration_s = points.get("start"), points.get("end"), points.get("duration_s")
         if start and end and duration_s is not None:
             start_str = datetime.fromisoformat(start).strftime("%d.%m.%Y %H:%M:%S")
             end_str = datetime.fromisoformat(end).strftime("%d.%m.%Y %H:%M:%S")
-            self.start_label.setText(f"Начало: {start_str}")
-            self.end_label.setText(f"Конец: {end_str}")
+            self.start_label.setText(f"Начало: {start_str} UTC")
+            self.end_label.setText(f"Конец: {end_str} UTC")
             self.duration_label.setText(f"Продолжительность: {timedelta(seconds=int(duration_s))}")
         else:
             self.start_label.setText("Начало: —")
@@ -1940,7 +2397,7 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Ошибка чтения файла", message)
 
     def redraw_map(self):
-        points = self.points or dict(lat=[], lon=[], value=[], hardness=[], t_rel=[], dist=[])
+        points = self.points or dict(lat=[], lon=[], value=[], hardness=[], speed=[], t_rel=[], dist=[])
         mode = self.color_mode_combo.currentText()
         if mode == "Твёрдость дна":
             map_points = dict(points, value=points.get("hardness", []))
@@ -1958,7 +2415,13 @@ class MainWindow(QMainWindow):
         axis_mode = self.settings.value("timeline_axis", "time")
         html = build_map_html(self.basemap_combo.currentText(), map_points, color_by,
                                vmin=vmin, vmax=vmax, steps=steps, axis_mode=axis_mode,
-                               legend_title=legend_title, tooltip_suffix=tooltip_suffix)
+                               legend_title=legend_title, tooltip_suffix=tooltip_suffix,
+                               depth_vals=points.get("value", []),
+                               speed_vals=points.get("speed", []),
+                               show_endpoints=not self.hide_endpoints_check.isChecked(),
+                               show_speed_track=self.show_speed_track_check.isChecked(),
+                               track_width=int(self.settings.value("track_line_width", 3)),
+                               speed_glow_width=int(self.settings.value("speed_glow_width", 12)))
         load_html(self.map_view, html, "main")
 
     def open_settings(self):
@@ -2000,6 +2463,15 @@ class MainWindow(QMainWindow):
     def on_offset_finished(self, result):
         self.statusBar().showMessage(f"Смещение: {result['offset_s']:+.3f} с")
         self.offset_btn.setEnabled(True)
+        # Дата/время из mtime файла .sl2 — лишь приближение (см. docs/CONTEXT.md);
+        # синхронизация с GNSS даёт настоящее UTC-время, поэтому раз она уже
+        # посчитана (только для одного загруженного файла — расчёт смещения
+        # не поддерживает мультиэхограмму), обновляем сводку точным значением.
+        if self.points and len(self.file_data) == 1 and result.get("start") and result.get("end"):
+            self.points["start"] = result["start"]
+            self.points["end"] = result["end"]
+            self.points["duration_s"] = result["duration_s"]
+            self.update_summary()
         dlg = OffsetDialog(self, self.basemap_combo.currentText(), result)
         dlg.exec()
 

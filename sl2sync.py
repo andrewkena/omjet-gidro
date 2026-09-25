@@ -53,6 +53,7 @@ SL2_FIELDS = [  # имя, смещение в кадре, формат
     ("channel", 32, "<H"),
     ("frame_index", 36, "<I"),
     ("freq", 50, "<B"),
+    ("unix_s", 60, "<I"),
     ("depth_ft", 64, "<f"),
     ("keel_ft", 68, "<f"),
     ("speed_kn", 100, "<f"),
@@ -134,9 +135,24 @@ def read_sl2(path, channel=None, with_echogram=False):
     s["has_gps"] = (s["lon_enc"] != 0) | (s["lat_enc"] != 0)
     s["depth_m"] = s["depth_ft"].astype(float) * FT
     s["speed_ms"] = s["speed_kn"].astype(float) * KN
+
+    # Поле "unix_s" (смещение 60) несёт настоящее unix-время (UTC, секунды) только
+    # у самого первого кадра записи (frame_index == 0) — у всех следующих кадров
+    # оно дублирует time_ms и абсолютным временем не является (проверено на
+    # реальных файлах: значение у frame_index==0 совпадает с датой/временем в
+    # имени файла Lowrance с точностью до нескольких секунд). Это надёжнее mtime
+    # файла, который зависит от того, как файл попал на диск.
+    start_epoch_utc = None
+    frame0 = s["frame_index"] == 0
+    if frame0.any():
+        candidate = int(s["unix_s"][frame0][0])
+        if 946684800 <= candidate <= 4102444800:  # 2000-01-01 .. 2100-01-01 UTC
+            start_epoch_utc = candidate
+
     info = dict(frames_total=int(len(a["channel"])), channels=summary,
                 channel=int(channel), pings=int(m.sum()), resyncs=resyncs,
-                duration_s=float(s["t_rel"][-1] - s["t_rel"][0]))
+                duration_s=float(s["t_rel"][-1] - s["t_rel"][0]),
+                start_epoch_utc=start_epoch_utc)
     return s, info
 
 
