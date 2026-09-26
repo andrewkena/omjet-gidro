@@ -4,7 +4,8 @@ sl2sync — привязка глубин эхолота Lowrance (.sl2) к то
 
 Что делает:
   1. Читает .sl2 (глубина, координаты/скорость встроенного GPS Lowrance, время пинга).
-  2. Читает GNSS-трек: NMEA-лог (GGA/RMC/ZDA), RTKLIB .pos (PPK) или CSV.
+  2. Читает GNSS-трек: NMEA-лог (GGA/RMC/ZDA), RTKLIB .pos (PPK), CSV или
+     UBX (бинарный поток u-blox, сообщения UBX-NAV-PVT).
   3. Находит смещение времени sl2 → UTC (кросс-корреляция скорости + уточнение по траектории),
      при необходимости — дрейф часов эхолота (ppm).
   4. Оценивает остаточную задержку глубины (по согласованности встречных/пересекающихся галсов)
@@ -53,6 +54,7 @@ SL2_FIELDS = [  # имя, смещение в кадре, формат
     ("channel", 32, "<H"),
     ("frame_index", 36, "<I"),
     ("freq", 50, "<B"),
+    ("range_ft", 44, "<f"),
     ("unix_s", 60, "<I"),
     ("depth_ft", 64, "<f"),
     ("keel_ft", 68, "<f"),
@@ -122,6 +124,28 @@ def read_sl2(path, channel=None, with_echogram=False):
     if with_echogram:
         echo_ch = [echo_raw[i] for i in np.where(m)[0]]
 
+    # Кадр с frame_index == 0 — служебная "заголовочная" запись канала (по одной
+    # в начале файла на каждый канал), не настоящий пинг. Поле "unix_s" (смещение
+    # 60) несёт в нём настоящее unix-время начала записи (UTC, секунды) — проверено
+    # на реальных файлах: совпадает с датой/временем в имени файла Lowrance с
+    # точностью до нескольких секунд, надёжнее mtime файла (зависит от того, как
+    # файл попал на диск). При этом сам служебный кадр может нести мусорные
+    # depth/позицию/time_ms — на одном из проверенных реальных файлов у него
+    # time_ms был равен 4294967262 (почти предел uint32, ≈49.7 сут), что при
+    # смешивании с настоящими пингами создавало гигантский ложный разрыв на
+    # графиках/эхограмме. Поэтому извлекаем unix_s, а сам кадр исключаем из
+    # данных целиком (теряем максимум один кадр на канал).
+    frame0 = s["frame_index"] == 0
+    start_epoch_utc = None
+    if frame0.any():
+        candidate = int(s["unix_s"][frame0][0])
+        if 946684800 <= candidate <= 4102444800:  # 2000-01-01 .. 2100-01-01 UTC
+            start_epoch_utc = candidate
+        keep = ~frame0
+        s = {k: v[keep] for k, v in s.items()}
+        if with_echogram:
+            echo_ch = [e for e, k in zip(echo_ch, keep) if k]
+
     s["t_rel"] = s["time_ms"].astype(float) / 1000.0
     order = np.argsort(s["t_rel"], kind="stable")
     if np.any(np.diff(s["t_rel"]) < -1.0):
@@ -135,19 +159,15 @@ def read_sl2(path, channel=None, with_echogram=False):
     s["has_gps"] = (s["lon_enc"] != 0) | (s["lat_enc"] != 0)
     s["depth_m"] = s["depth_ft"].astype(float) * FT
     s["speed_ms"] = s["speed_kn"].astype(float) * KN
-
-    # Поле "unix_s" (смещение 60) несёт настоящее unix-время (UTC, секунды) только
-    # у самого первого кадра записи (frame_index == 0) — у всех следующих кадров
-    # оно дублирует time_ms и абсолютным временем не является (проверено на
-    # реальных файлах: значение у frame_index==0 совпадает с датой/временем в
-    # имени файла Lowrance с точностью до нескольких секунд). Это надёжнее mtime
-    # файла, который зависит от того, как файл попал на диск.
-    start_epoch_utc = None
-    frame0 = s["frame_index"] == 0
-    if frame0.any():
-        candidate = int(s["unix_s"][frame0][0])
-        if 946684800 <= candidate <= 4102444800:  # 2000-01-01 .. 2100-01-01 UTC
-            start_epoch_utc = candidate
+    # Поле "range_ft" (смещение 44) — окно показа (диапазон) сонара для этого
+    # пинга, футы; Lowrance меняет его автоматически ступенями (проверено на
+    # реальных файлах: 4/6/10/16/20/30 м) и он всегда ощутимо больше фактической
+    # глубины дна (0 нарушений depth>range на обоих проверенных файлах). Именно
+    # это поле определяет, какой реальной глубине соответствует байт N в сыром
+    # столбце эхограммы (см. build_echogram_image в gui.py) — раньше это поле
+    # не было известно, и для растяжения столбца ошибочно пробовали использовать
+    # depth_ft (глубину дна), что давало ложные резкие скачки на картинке.
+    s["range_m"] = s["range_ft"].astype(float) * FT
 
     info = dict(frames_total=int(len(a["channel"])), channels=summary,
                 channel=int(channel), pings=int(m.sum()), resyncs=resyncs,
@@ -306,6 +326,134 @@ def read_csv_track(path):
         dict(format="CSV (время UTC)", epochs=len(r), height="из CSV")
 
 
+UBX_SYNC1, UBX_SYNC2 = 0xB5, 0x62
+UBX_NAV_PVT = (0x01, 0x07)
+UBX_NAV_POSLLH = (0x01, 0x02)
+UBX_NAV_STATUS = (0x01, 0x03)
+UBX_NAV_TIMEUTC = (0x01, 0x21)
+
+
+def read_ubx(path):
+    """Бинарный поток u-blox — читаем позицию по эпохам (номер эпохи — поле iTOW,
+    общее для всех NAV-сообщений одного цикла решения). Два варианта, оба
+    встречаются на практике:
+    - **UBX-NAV-PVT** (класс 0x01, id 0x07) — всё в одном сообщении: позиция,
+      время, тип фикса (включая RTK float/fixed через carrSoln).
+    - **UBX-NAV-POSLLH + UBX-NAV-STATUS + UBX-NAV-TIMEUTC** — классический набор
+      без NAV-PVT (так пишут при сыром логировании для постобработки в RTKLIB,
+      см. `read_pos`/docs/CONTEXT.md — это основной штатный путь для RTK/PPK в
+      этом проекте, UBX тут — быстрый способ посмотреть трек без прогона через
+      RTKLIB). У NAV-STATUS нет признака RTK float/fixed (это поле появилось
+      только в NAV-PVT) — качество определяется грубее: только DGPS/одиночный/
+      dead reckoning.
+
+    Формат кадра: 0xB5 0x62, class(1) id(1) length(2 LE) payload(length)
+    ck_a(1) ck_b(1) — контрольная сумма (8-бит Флетчера) проверяется, битые
+    кадры пропускаются."""
+    with open(path, "rb") as fh:
+        data = fh.read()
+    n = len(data)
+    rows = []
+    bad_checksum = 0
+    has_pvt = False
+    cur = None
+
+    def flush():
+        if cur and "t" in cur and "lat" in cur:
+            rows.append((cur["t"], cur["lat"], cur["lon"], cur.get("h", np.nan),
+                          cur.get("q", 1)))
+
+    pos = 0
+    while pos + 8 <= n:
+        if data[pos] != UBX_SYNC1 or data[pos + 1] != UBX_SYNC2:
+            pos += 1
+            continue
+        cls_id, msg_id = data[pos + 2], data[pos + 3]
+        length = struct.unpack_from("<H", data, pos + 4)[0]
+        end = pos + 6 + length
+        if end + 2 > n:
+            break
+        ck_a = ck_b = 0
+        for b in data[pos + 2:end]:
+            ck_a = (ck_a + b) & 0xFF
+            ck_b = (ck_b + ck_a) & 0xFF
+        if ck_a != data[end] or ck_b != data[end + 1]:
+            bad_checksum += 1
+            pos += 1
+            continue
+
+        key = (cls_id, msg_id)
+        if key in (UBX_NAV_PVT, UBX_NAV_POSLLH, UBX_NAV_STATUS, UBX_NAV_TIMEUTC) and length >= 4:
+            payload = data[pos + 6:end]
+            itow = struct.unpack_from("<I", payload, 0)[0]
+            if cur is None or cur["itow"] != itow:
+                flush()
+                cur = {"itow": itow}
+
+            if key == UBX_NAV_PVT and length >= 40:
+                has_pvt = True
+                (year, month, day, hour, minute, sec, valid, _tacc, nano,
+                 fixtype, flags, _flags2, _numsv, lon_e7, lat_e7, _height_mm,
+                 hmsl_mm) = struct.unpack_from("<HBBBBBBIiBBBBiiii", payload, 4)
+                if valid & 0x03 == 0x03:  # validDate | validTime
+                    try:
+                        cur["t"] = (datetime(year, month, day, hour, minute, sec,
+                                              tzinfo=timezone.utc).timestamp() + nano * 1e-9)
+                    except ValueError:
+                        pass
+                cur["lat"], cur["lon"] = lat_e7 / 1e7, lon_e7 / 1e7
+                cur["h"] = hmsl_mm / 1000.0
+                carr_soln = (flags >> 6) & 0x03   # 0 нет, 1 float, 2 fixed
+                diff_soln = (flags >> 1) & 0x01
+                if fixtype in (0, 5):
+                    cur["q"] = 0
+                elif carr_soln == 2:
+                    cur["q"] = 4
+                elif carr_soln == 1:
+                    cur["q"] = 5
+                elif fixtype in (1, 4):
+                    cur["q"] = 6
+                elif diff_soln:
+                    cur["q"] = 2
+                else:
+                    cur["q"] = 1
+            elif key == UBX_NAV_POSLLH and length >= 28:
+                lon_e7, lat_e7, _height_mm, hmsl_mm, _hacc, _vacc = \
+                    struct.unpack_from("<iiiiII", payload, 4)
+                cur["lat"], cur["lon"] = lat_e7 / 1e7, lon_e7 / 1e7
+                cur["h"] = hmsl_mm / 1000.0
+            elif key == UBX_NAV_TIMEUTC and length >= 20:
+                _tacc, nano, year, month, day, hour, minute, sec, valid = \
+                    struct.unpack_from("<IiHBBBBBB", payload, 4)
+                if valid & 0x04:  # validUTC
+                    try:
+                        cur["t"] = (datetime(year, month, day, hour, minute, sec,
+                                              tzinfo=timezone.utc).timestamp() + nano * 1e-9)
+                    except ValueError:
+                        pass
+            elif key == UBX_NAV_STATUS and length >= 16:
+                gpsfix, flags, _fixstat, _flags2 = struct.unpack_from("<BBBB", payload, 4)
+                diff_soln = (flags >> 1) & 0x01
+                if gpsfix in (0, 5):
+                    cur["q"] = 0
+                elif gpsfix in (1, 4):
+                    cur["q"] = 6
+                elif diff_soln:
+                    cur["q"] = 2
+                else:
+                    cur.setdefault("q", 1)
+        pos = end + 2
+    flush()
+    if not rows:
+        sys.exit("В .ubx не найдено валидных сообщений с позицией/временем "
+                  "(NAV-PVT или NAV-POSLLH+NAV-TIMEUTC)")
+    r = np.array(rows)
+    fmt = "UBX (NAV-PVT)" if has_pvt else "UBX (NAV-POSLLH+NAV-STATUS+NAV-TIMEUTC)"
+    return dict(t=r[:, 0], lat=r[:, 1], lon=r[:, 2], h=r[:, 3], q=r[:, 4].astype(int)), \
+        dict(format=fmt, epochs=len(r), bad_checksum=bad_checksum,
+             height="MSL (u-blox hMSL)")
+
+
 def read_gnss(path, fmt="auto", force_date=None):
     if fmt == "auto":
         ext = os.path.splitext(path)[1].lower()
@@ -313,12 +461,15 @@ def read_gnss(path, fmt="auto", force_date=None):
             fmt = "pos"
         elif ext == ".csv":
             fmt = "csv"
+        elif ext == ".ubx":
+            fmt = "ubx"
         else:
             with open(path, "r", errors="ignore") as fh:
                 head = fh.read(65536)
             fmt = "nmea" if re.search(r"\$[A-Z]{2}(GGA|RMC)", head) else "pos"
     g, info = {"nmea": lambda: read_nmea(path, force_date),
-               "pos": lambda: read_pos(path), "csv": lambda: read_csv_track(path)}[fmt]()
+               "pos": lambda: read_pos(path), "csv": lambda: read_csv_track(path),
+               "ubx": lambda: read_ubx(path)}[fmt]()
     order = np.argsort(g["t"], kind="stable")
     g = {k: v[order] for k, v in g.items()}
     keep = np.concatenate([[True], np.diff(g["t"]) > 1e-6]) & np.isfinite(g["lat"])
@@ -503,7 +654,7 @@ def estimate_time_model(s, g, mot, args, rep):
     else:
         log("  дрейф не оценивался: мало окон с поворотами (нужны записи > 10–15 мин)")
     return dict(a=float(a), b=float(b), t_mid=float(t_mid), coarse=tau0, ncc=ncc,
-                rms_pos=float(rms1), edge=bool(edge))
+                rms_pos=float(rms1), edge=bool(edge), drift_windows=len(wins))
 
 
 # ============================================================================
@@ -662,9 +813,9 @@ def build_parser():
         description="Привязка глубин Lowrance .sl2 к точному GNSS-треку",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("sl2", help="файл эхолота .sl2")
-    p.add_argument("gnss", help="GNSS-трек: NMEA-лог, RTKLIB .pos или CSV")
+    p.add_argument("gnss", help="GNSS-трек: NMEA-лог, RTKLIB .pos, CSV или UBX (u-blox binary)")
     p.add_argument("-o", "--out", help="папка результатов (по умолчанию <имя_sl2>_out)")
-    p.add_argument("--gnss-format", default="auto", choices=["auto", "nmea", "pos", "csv"])
+    p.add_argument("--gnss-format", default="auto", choices=["auto", "nmea", "pos", "csv", "ubx"])
     p.add_argument("--date", help="дата UTC для NMEA без RMC/ZDA, ГГГГ-ММ-ДД")
     p.add_argument("--channel", type=int, help="канал sl2 (0 Primary, 1 Secondary, 2 DownScan)")
     g_ = p.add_argument_group("синхронизация")

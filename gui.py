@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QColorDialog, QComboBox,
 from sl2sync import (build_parser, estimate_time_model, gnss_motion, make_proj,
                       ping_positions, read_gnss, read_sl2)
 
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.1"
 GITHUB_REPO = "andrewkena/omjet-gidro"
 ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "gidro.ico")
 
@@ -63,6 +63,49 @@ def new_map_view():
     return view
 
 
+def help_icon(tooltip):
+    """Значок «?» с описанием принимаемых файлов во всплывающей подсказке —
+    ставится рядом с полями выбора файла, чтобы не загромождать интерфейс
+    текстом, но дать ответ на вопрос «а что сюда можно загрузить»."""
+    lbl = QLabel("?")
+    lbl.setToolTip(tooltip)
+    lbl.setFixedSize(18, 18)
+    lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    lbl.setStyleSheet(
+        "QLabel { background: #555; color: #eee; border-radius: 9px; font-weight: bold; }")
+    lbl.setCursor(Qt.CursorShape.WhatsThisCursor)
+    return lbl
+
+
+def label_with_help(text, tooltip):
+    """Подпись поля/строки отчёта + значок «?» с пояснением рядом — для мест,
+    где подписи в форме (QFormLayout.addRow принимает виджет вместо строки)."""
+    w = QWidget()
+    lay = QHBoxLayout(w)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.addWidget(QLabel(text))
+    lay.addWidget(help_icon(tooltip))
+    return w
+
+
+SL2_FILE_HELP = "Запись эхолота Lowrance — файл .sl2."
+GNSS_FILE_HELP = (
+    "GNSS-трек, один из форматов:\n"
+    "• NMEA-лог (.nmea) — строки GGA + RMC/ZDA\n"
+    "• RTKLIB .pos — результат постобработки PPK (lat/lon/height, не ECEF/ENU)\n"
+    "• CSV — колонки time, lat, lon (опционально h, q)\n"
+    "• UBX (.ubx) — бинарный поток u-blox: NAV-PVT, либо NAV-POSLLH +\n"
+    "  NAV-STATUS + NAV-TIMEUTC.\n"
+    "Для точного RTK лучше сначала обработать пару Base+Rover .ubx через\n"
+    "RTKLIB в .pos — прямое чтение .ubx даёт только качество фикса самого\n"
+    "приёмника (обычно одиночный, без поправок в реальном времени)."
+)
+WATERLINE_FILE_HELP = (
+    "Точки уреза воды — CSV с колонками lat/lon (разделитель определяется\n"
+    "автоматически) либо обычный текст: на каждой строке два числа lat lon."
+)
+
+
 _html_seq = itertools.count()
 
 
@@ -83,7 +126,8 @@ OMSK_CENTER = [54.9885, 73.3242]
 def build_map_html(basemap, points, color_by_depth=True, vmin=None, vmax=None, steps=32,
                     axis_mode="time", legend_title="Глубина, м", tooltip_suffix=" м",
                     depth_vals=None, speed_vals=None, show_endpoints=True,
-                    show_speed_track=False, track_width=3, speed_glow_width=12):
+                    show_speed_track=False, track_width=3, speed_glow_width=12,
+                    gnss_track=None):
     tile = BASEMAPS[basemap]
     lat, lon, val = points["lat"], points["lon"], points["value"]
     axis_key = "dist" if axis_mode == "distance" else "t_rel"
@@ -190,6 +234,13 @@ var layer = L.geoJSON(data, {{
   }}
 }});
 if (!showSpeedTrack) {{ layer.addTo(map); }}
+
+var gnssTrackPts = {json.dumps([[la, lo] for la, lo in zip((gnss_track or {}).get("lat", []),
+                                                             (gnss_track or {}).get("lon", []))])};
+if (gnssTrackPts.length > 1) {{
+  L.polyline(gnssTrackPts, {{color: '#ff0000', weight: 1.5, opacity: 0.85,
+                             interactive: false}}).addTo(map);
+}}
 
 var speedVals = {json.dumps(speed_vals)};
 var trackLineWidth = {int(track_width)};
@@ -411,28 +462,155 @@ if (data.features.length) {{
 </body></html>"""
 
 
-def build_tracks_html(basemap, tracks):
+def build_tracks_html(basemap, tracks, depth_vmin=None, depth_vmax=None, sync=False):
+    """tracks: список dict(name, color, lat, lon[, depth]) — трек с ключом
+    depth рисуется точками, окрашенными по глубине (та же радужная палитра,
+    что на основной карте: минимум — красный, максимум — синий), остальные —
+    обычной сплошной линией цвета color (например, GNSS-трек — глубины нет).
+
+    sync=True подключает QWebChannel (см. TrackCompareBridge в OffsetDialog):
+    движение карты (пан/зум) и наведение на точку трека с глубиной
+    транслируются на вторую карту через Python — сами карты это две разные
+    страницы в разных QWebEngineView, прямой связи между их JS нет."""
     tile = BASEMAPS[basemap]
     all_lat = [la for t in tracks for la in t["lat"]]
     all_lon = [lo for t in tracks for lo in t["lon"]]
     center = [sum(all_lat) / len(all_lat), sum(all_lon) / len(all_lon)] if all_lat else [0, 0]
+
+    depth_vals = [d for t in tracks for d in (t.get("depth") or [])]
+    if depth_vmin is None:
+        depth_vmin = min(depth_vals) if depth_vals else 0.0
+    if depth_vmax is None:
+        depth_vmax = max(depth_vals) if depth_vals else 1.0
+    if depth_vmax <= depth_vmin:
+        depth_vmax = depth_vmin + 1e-6
+
     lines = []
     for t in tracks:
         coords = list(zip(t["lat"], t["lon"]))
-        lines.append(
-            f"L.polyline({json.dumps(coords)}, {{color: '{t['color']}', weight: 2}})"
-            f".bindTooltip({json.dumps(t['name'])}).addTo(map);")
+        depth = t.get("depth")
+        if depth:
+            ping_idx = t.get("ping_idx") or list(range(len(coords)))
+            lines.append(f"drawDepthTrack({json.dumps(coords)}, {json.dumps(depth)}, "
+                          f"{json.dumps(ping_idx)}, {json.dumps(t['name'])});")
+        else:
+            lines.append(
+                f"L.polyline({json.dumps(coords)}, {{color: '{t['color']}', weight: 4}})"
+                f".bindTooltip({json.dumps(t['name'])}).addTo(map);")
     bounds = list(zip(all_lat, all_lon))
+    channel_script = ('<script src="qrc:///qtwebchannel/qwebchannel.js"></script>'
+                       if sync else '')
+    channel_init = ('new QWebChannel(qt.webChannelTransport, '
+                     'function (channel) { bridge = channel.objects.bridge; });'
+                     if sync else '')
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<style>html,body,#map{{height:100%;margin:0}}</style>
+{channel_script}
+<style>html,body,#map{{height:100%;margin:0}}
+.hover-tip{{background:#222;color:#fff;border:none;font:12px sans-serif}}</style>
 </head><body>
 <div id="map"></div>
 <script>
 var map = L.map('map', {{preferCanvas: true, attributionControl: false}}).setView([{center[0]}, {center[1]}], 15);
 L.tileLayer('{tile["url"]}', {{maxZoom: {tile["max_zoom"]}}}).addTo(map);
+var depthVmin = {depth_vmin}, depthVmax = {depth_vmax};
+var jetStops = [
+  [0.0, [0, 0, 143]], [0.125, [0, 0, 255]], [0.375, [0, 255, 255]],
+  [0.625, [255, 255, 0]], [0.875, [255, 0, 0]], [1.0, [128, 0, 0]]
+];
+function jetColor(t) {{
+  for (var i = 0; i < jetStops.length - 1; i++) {{
+    var a = jetStops[i], b = jetStops[i + 1];
+    if (t <= b[0] || i === jetStops.length - 2) {{
+      var f = (t - a[0]) / (b[0] - a[0]);
+      return 'rgb(' + Math.round(a[1][0] + f * (b[1][0] - a[1][0])) + ',' +
+                       Math.round(a[1][1] + f * (b[1][1] - a[1][1])) + ',' +
+                       Math.round(a[1][2] + f * (b[1][2] - a[1][2])) + ')';
+    }}
+  }}
+}}
+function depthColor(v) {{
+  var t = Math.max(0, Math.min(1, (v - depthVmin) / (depthVmax - depthVmin)));
+  return jetColor(1 - t);
+}}
+
+var bridge = null;
+var suppressMove = false;
+{channel_init}
+
+var cursorMarker = L.circleMarker([0, 0], {{radius: 8, color: '#fff', weight: 2,
+                                             fillColor: '#ffd400', fillOpacity: 1}});
+cursorMarker.bindTooltip('', {{permanent: true, direction: 'top', className: 'hover-tip'}});
+var depthTrackCoords = [], depthTrackVals = [], depthTrackPingIdx = [];
+
+function showCursor(idx) {{
+  if (idx < 0 || idx >= depthTrackCoords.length) {{
+    if (cursorMarker._map) {{ map.removeLayer(cursorMarker); }}
+    return;
+  }}
+  var p = depthTrackCoords[idx];
+  if (!cursorMarker._map) {{ cursorMarker.addTo(map); }}
+  cursorMarker.setLatLng(p);
+  cursorMarker.setTooltipContent(depthTrackVals[idx].toFixed(2) + ' м');
+  cursorMarker.openTooltip();
+}}
+
+// depthTrackPingIdx отсортирован по возрастанию (порядок пингов в записи) —
+// двоичный поиск ближайшего к target номера пинга.
+function findClosestByPingIdx(target) {{
+  var arr = depthTrackPingIdx;
+  if (!arr.length) {{ return -1; }}
+  var lo = 0, hi = arr.length - 1;
+  while (lo < hi) {{
+    var mid = (lo + hi) >> 1;
+    if (arr[mid] < target) {{ lo = mid + 1; }} else {{ hi = mid; }}
+  }}
+  if (lo > 0 && Math.abs(arr[lo - 1] - target) <= Math.abs(arr[lo] - target)) {{ return lo - 1; }}
+  return lo;
+}}
+
+// Вызывается из Python — эхо наведения со второй карты. pingIdx — настоящий
+// номер пинга (не позиция в массиве этой карты — маски "до"/"после" разные,
+// см. compute_time_offset в gui.py), поэтому ищем ближайший имеющийся у себя.
+function remoteHighlight(pingIdx) {{
+  showCursor(pingIdx < 0 ? -1 : findClosestByPingIdx(pingIdx));
+}}
+
+// Вызывается из Python — эхо пана/зума второй карты; suppressMove не даёт уйти в петлю.
+function syncView(lat, lng, zoom) {{
+  suppressMove = true;
+  map.setView([lat, lng], zoom);
+  suppressMove = false;
+}}
+
+map.on('moveend', function () {{
+  if (!suppressMove && bridge) {{
+    var c = map.getCenter();
+    bridge.viewChanged(c.lat, c.lng, map.getZoom());
+  }}
+}});
+map.on('mouseout', function () {{
+  showCursor(-1);
+  if (bridge) {{ bridge.hoverEnd(); }}
+}});
+
+function drawDepthTrack(coords, depth, pingIdx, name) {{
+  depthTrackCoords = coords;
+  depthTrackVals = depth;
+  depthTrackPingIdx = pingIdx;
+  var group = L.layerGroup().addTo(map);
+  for (let i = 0; i < coords.length; i++) {{
+    L.circleMarker(coords[i], {{radius: 4, weight: 0, fillOpacity: 0.85,
+                                 fillColor: depthColor(depth[i]), color: depthColor(depth[i])}})
+      .on('mouseover', function () {{
+        showCursor(i);
+        if (bridge) {{ bridge.hoverPoint(pingIdx[i]); }}
+      }})
+      .addTo(group);
+  }}
+}}
 {chr(10).join(lines)}
 var bounds = {json.dumps(bounds)};
 if (bounds.length) {{ map.fitBounds(bounds, {{maxZoom: 18}}); }}
@@ -485,19 +663,42 @@ def cumulative_distance(lat, lon):
     return np.concatenate([[0.0], np.cumsum(seg)]).tolist()
 
 
-def estimate_bottom_hardness_ping(record, depth_m):
+def estimate_bottom_hardness_ping(record, depth_m, range_m=None):
     """Грубая, неоткалиброванная оценка твёрдости дна по ширине первого пика
     (резче — твёрже) и наличию второго эха на удвоенной глубине (сигнал
     поверхность→дно→поверхность→дно; заметен обычно только на твёрдом дне).
     Формат сырых байт эхограммы не задокументирован и не проверен на реальном
     железе (см. read_echogram_waterfall) — это ориентировочный индекс, а не
-    калиброванное измерение, как у специализированных систем (RoxAnn, QTC)."""
+    калиброванное измерение, как у специализированных систем (RoxAnn, QTC).
+
+    range_m — окно показа сонара для этого пинга (см. read_sl2, поле range_ft):
+    Lowrance меняет его автоматически ступенями, поэтому байт ≠ постоянная доля
+    метра между пингами — без пересчёта ширины пика в метры через range_m
+    резкость на бо́льшем диапазоне (меньше байт на метр) систематически
+    получалась «мягче» независимо от реальной твёрдости дна. Также используется
+    (вместе с depth_m) для поиска самого пика дна: первые байты пинга — это
+    выброс от импульса излучения (плато почти одинаковых значений у
+    поверхности, обычно выше настоящего эха от дна — проверено на реальных
+    данных) и глобальный максимум по всему столбцу почти всегда попадает
+    именно в этот выброс, а не в дно. Ищем пик в окне вокруг уже известной
+    глубины (из штатного трекера эхолота, depth_m), а не по всему столбцу."""
     if not record or depth_m is None or depth_m <= 0:
         return None
     arr = np.frombuffer(record, dtype=np.uint8).astype(np.float32)
-    if len(arr) < 4:
+    n = len(arr)
+    if n < 4:
         return None
-    i_peak = int(np.argmax(arr))
+    if range_m and range_m > 0:
+        expected = depth_m / range_m * n
+        margin = max(10.0, 0.25 * expected)
+        lo, hi = max(0, int(expected - margin)), min(n, int(expected + margin) + 1)
+    else:
+        # Без range_m окно вокруг ожидаемого байта не посчитать — просто
+        # отбрасываем небольшой начальный участок с выбросом от импульса.
+        lo, hi = min(n - 1, max(4, int(n * 0.03))), n
+    if hi - lo < 4:
+        return None
+    i_peak = lo + int(np.argmax(arr[lo:hi]))
     peak_val = arr[i_peak]
     if peak_val < 20:
         return None
@@ -506,24 +707,27 @@ def estimate_bottom_hardness_ping(record, depth_m):
     while left > 0 and arr[left] > half:
         left -= 1
     right = i_peak
-    while right < len(arr) - 1 and arr[right] > half:
+    while right < n - 1 and arr[right] > half:
         right += 1
     width = max(1, right - left)
+    if range_m:
+        width = width * (range_m / n)
     sharpness = 1.0 / width
 
     second_echo = 0.0
     i2 = 2 * i_peak
-    if i2 + 2 < len(arr):
+    if i2 + 2 < n:
         second_echo = float(np.max(arr[max(0, i2 - 2):i2 + 3])) / 255.0
     return sharpness, second_echo
 
 
-def compute_hardness_index(records, depth_m):
+def compute_hardness_index(records, depth_m, range_m=None):
     n = len(records)
     sharpness = np.full(n, np.nan)
     second = np.zeros(n)
     for i in range(n):
-        est = estimate_bottom_hardness_ping(records[i], depth_m[i])
+        r = range_m[i] if range_m is not None else None
+        est = estimate_bottom_hardness_ping(records[i], depth_m[i], r)
         if est is not None:
             sharpness[i], second[i] = est
     finite = sharpness[np.isfinite(sharpness)]
@@ -543,8 +747,9 @@ def read_echogram_file(sl2_path):
     t_rel = s["t_rel"][m]
     depth = s["depth_m"][m]
     speed = s["speed_ms"][m]
+    range_m = s["range_m"][m]
     records = [s["echogram"][i] for i in np.where(m)[0]]
-    hardness = compute_hardness_index(records, depth.tolist())
+    hardness = compute_hardness_index(records, depth.tolist(), range_m.tolist())
     duration_s = info["duration_s"]
     if info.get("start_epoch_utc") is not None:
         # Настоящее время начала записи из самого файла (поле "unix_s" первого
@@ -569,7 +774,9 @@ def read_echogram_waterfall(sl2_path):
     после 144-байтного заголовка кадра. Формат байтов документально не описан
     в docs/CONTEXT.md и не проверен на реальном железе (см. открытые вопросы
     там же) — по общепринятому для sl2 предположению это 8-битная амплитуда
-    по глубине, старт столбца сверху (поверхность) вниз (дно)."""
+    по глубине, старт столбца сверху (поверхность) вниз (дно). range_m — окно
+    показа сонара для каждого пинга (см. read_sl2) — нужно для калибровки
+    столбцов эхограммы под единый масштаб глубины (build_echogram_image)."""
     s, info = read_sl2(sl2_path, with_echogram=True)
     # В пределах одного канала могут чередоваться пинги разных частот (например,
     # CHIRP low/high) — вперемешку они дают полосатую/рваную картинку, поэтому
@@ -580,6 +787,7 @@ def read_echogram_waterfall(sl2_path):
     m = s["freq"] == dominant
     records = [s["echogram"][i] for i in np.where(m)[0]]
     return dict(records=records, depth_m=s["depth_m"][m].tolist(),
+                range_m=s["range_m"][m].tolist(),
                 t_rel=s["t_rel"][m].tolist(),
                 dist=cumulative_distance(s["lat"][m], s["lon"][m]),
                 mixed_freqs=mixed_freqs)
@@ -592,30 +800,96 @@ def format_axis_label(v, axis_mode):
     return f"{m}:{sec:02d}"
 
 
-def build_echogram_image(records, depth_m=None):
-    """Складываем сырые байты пинга как есть, без домыслов: строка 0 — начало
-    записи каждого пинга (обычно поверхность), дальше — по возрастанию байта.
+def build_echogram_image(records, range_m=None):
+    """Складываем сырые байты пинга: строка 0 — начало записи каждого пинга
+    (поверхность), дальше — по возрастанию байта. Короткие пинги дополняются
+    как «нет данных» (валидная маска).
 
-    Раньше здесь была попытка растянуть/сжать каждый столбец под глубину дна
-    (depth_m) в предположении диапазон≈глубина — но это предположение,
-    похоже, само по себе неверно (реальный диапазон сонара у Lowrance меняется
-    ступенями автодиапазона, а не совпадает с глубиной), и вносило собственные
-    искажения (острые «иглы» там, где не должно быть). depth_m сейчас не
-    используется — оставлен в сигнатуре на будущее, если формат прояснится.
-    Короткие пинги просто дополняются как «нет данных» (валидная маска), не
-    домысливая физическую глубину по вертикали."""
+    range_m — окно показа сонара для каждого пинга, метры (см. read_sl2:
+    поле range_ft, найдено и проверено на реальных файлах — Lowrance меняет
+    его автоматически ступенями, 4/6/10/16/20/30 м на проверенных файлах, и
+    оно всегда больше фактической глубины дна). Раньше здесь была попытка
+    растянуть столбец под глубину ДНА (depth_m) в предположении диапазон≈
+    глубина — предположение было неверным (диапазон ощутимо больше глубины)
+    и давало ложные резкие скачки. С правильным полем (range_m) столбцы
+    пересчитываются к единому масштабу глубины (общий максимальный диапазон
+    в записи) через линейную интерполяцию — это убирает видимые «швы» на
+    границах смены диапазона. Без range_m (не передан) — старое поведение:
+    байты как есть, без калибровки.
+
+    Возвращает (arr, valid, calibrated_range_m) — третий элемент None, если
+    калибровка не выполнялась (range_m не передан или непригоден)."""
     lengths = [len(r) for r in records if r]
     if not lengths:
-        return None, None
-    rows = max(lengths)
-    arr = np.zeros((rows, len(records)), dtype=np.uint8)
-    valid = np.zeros((rows, len(records)), dtype=bool)
+        return None, None, None
+    native_rows = max(lengths)
+    n = len(records)
+    arr = np.zeros((native_rows, n), dtype=np.uint8)
+    valid = np.zeros((native_rows, n), dtype=bool)
     for col, r in enumerate(records):
         if r:
-            n = len(r)
-            arr[:n, col] = np.frombuffer(r, dtype=np.uint8)
-            valid[:n, col] = True
-    return arr, valid
+            m = len(r)
+            arr[:m, col] = np.frombuffer(r, dtype=np.uint8)
+            valid[:m, col] = True
+
+    if range_m is None:
+        return arr, valid, None
+    range_arr = np.asarray(range_m, dtype=np.float32)
+    if len(range_arr) != n:
+        return arr, valid, None
+    target_range = float(np.nanmax(range_arr)) if n else 0.0
+    if not np.isfinite(target_range) or target_range <= 0:
+        return arr, valid, None
+
+    target_rows = native_rows
+    depths = np.linspace(0.0, target_range, target_rows, dtype=np.float32)
+    out_arr = np.zeros((target_rows, n), dtype=np.uint8)
+    out_valid = np.zeros((target_rows, n), dtype=bool)
+    chunk = 4096  # ограничиваем пиковую память при интерполяции больших записей
+    for start in range(0, n, chunk):
+        end = min(n, start + chunk)
+        rng = range_arr[start:end]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            src = depths[:, None] / rng[None, :] * native_rows
+        i0 = np.floor(src).astype(np.int32)
+        frac = (src - i0).astype(np.float32)
+        bad = (i0 < 0) | (i0 >= native_rows - 1) | ~np.isfinite(src)
+        i0c = np.clip(i0, 0, native_rows - 2)
+        i1c = i0c + 1
+        cols = np.broadcast_to(np.arange(end - start), i0c.shape)
+        sub_arr, sub_valid = arr[:, start:end], valid[:, start:end]
+        a0 = sub_arr[i0c, cols].astype(np.float32)
+        a1 = sub_arr[i1c, cols].astype(np.float32)
+        blended = a0 * (1 - frac) + a1 * frac
+        v = sub_valid[i0c, cols] & sub_valid[i1c, cols] & ~bad
+        out_arr[:, start:end] = np.where(v, blended, 0).astype(np.uint8)
+        out_valid[:, start:end] = v
+    return out_arr, out_valid, target_range
+
+
+def block_reduce_mean(arr, valid, row_factor, col_factor):
+    """Огрубляет эхограмму усреднением по блокам row_factor×col_factor —
+    нужно перед показом при сильном уменьшении масштаба: если просто отдать
+    Qt десятки тысяч столбцов на отрисовку в узкую полосу, растяжение/сжатие
+    у QPainter (даже со SmoothPixmapTransform — это билинейная выборка, а не
+    честное усреднение области) даёт алиасинг — зубчатые вертикальные полосы
+    вместо гладкой картины, которая видна при масштабе 1:1 (проверено на
+    реальном файле). Усредняем только по валидным сэмплам блока, чтобы
+    маска «нет данных» (короткие пинги) не затемняла среднее."""
+    if row_factor <= 1 and col_factor <= 1:
+        return arr, valid
+    row_factor, col_factor = max(1, row_factor), max(1, col_factor)
+    rows, cols = arr.shape
+    new_rows, new_cols = max(1, rows // row_factor), max(1, cols // col_factor)
+    arr = arr[:new_rows * row_factor, :new_cols * col_factor]
+    valid = valid[:new_rows * row_factor, :new_cols * col_factor]
+    arr = arr.reshape(new_rows, row_factor, new_cols, col_factor)
+    valid_r = valid.reshape(new_rows, row_factor, new_cols, col_factor)
+    valid_count = valid_r.sum(axis=(1, 3))
+    arr_sum = np.where(valid_r, arr, 0).sum(axis=(1, 3), dtype=np.float32)
+    out_arr = np.divide(arr_sum, valid_count, out=np.zeros_like(arr_sum),
+                         where=valid_count > 0)
+    return out_arr.astype(np.uint8), valid_count > 0
 
 
 def array_to_qimage(arr):
@@ -695,6 +969,14 @@ def merge_gnss_tracks(gnss_paths):
     return {k: v[order] for k, v in merged.items()}
 
 
+def read_gnss_track_points(gnss_paths):
+    """Только lat/lon объединённого GNSS-трека — для показа тонкой красной линией
+    на главной карте (отдельно от полного compute_time_offset, который нужен
+    только при расчёте смещения)."""
+    g = merge_gnss_tracks(gnss_paths)
+    return dict(lat=g["lat"].tolist(), lon=g["lon"].tolist())
+
+
 def compute_isobaths(lat, lon, depth, waterline_points, cell, interval, fill_steps, smooth=0.0):
     """Грид глубин (линейная интерполяция) + линии постоянной глубины и залитые
     диапазоны глубин через matplotlib.contour/contourf. Точки уреза воды
@@ -715,6 +997,7 @@ def compute_isobaths(lat, lon, depth, waterline_points, cell, interval, fill_ste
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.path import Path as MplPath
 
     lat_arr = np.array(list(lat) + [p[0] for p in waterline_points])
     lon_arr = np.array(list(lon) + [p[1] for p in waterline_points])
@@ -740,8 +1023,24 @@ def compute_isobaths(lat, lon, depth, waterline_points, cell, interval, fill_ste
         Zs = np.where(nan_mask, Zfill, Z)
         Zs = gaussian_filter(Zs, sigma=float(smooth))
         Z = np.where(nan_mask, np.nan, Zs)
-    Zm = np.ma.masked_invalid(Z)
 
+    if len(waterline_points) >= 3:
+        # Изобаты не должны заходить на сушу за нарисованный урез воды: замыкаем
+        # нарисованную линию в многоугольник (от последней точки к первой) и
+        # определяем, какая сторона — вода, по тому, где лежит сам трек (лодка
+        # не плавает по суше); ячейки сетки на другой стороне маскируем — тогда
+        # contour/contourf там ничего не рисуют, без ручного отреза геометрии.
+        wl_E, wl_N = fwd.transform([p[1] for p in waterline_points],
+                                    [p[0] for p in waterline_points])
+        wl_path = MplPath(np.column_stack([wl_E, wl_N]))
+        track_pts = np.column_stack([E[:len(lat)], N[:len(lat)]])
+        track_inside = wl_path.contains_points(track_pts).mean() >= 0.5
+        grid_inside = wl_path.contains_points(
+            np.column_stack([GX.ravel(), GY.ravel()])).reshape(GX.shape)
+        water_mask = grid_inside if track_inside else ~grid_inside
+        Z = np.where(water_mask, Z, np.nan)
+
+    Zm = np.ma.masked_invalid(Z)
     zmin, zmax = float(np.nanmin(Z)), float(np.nanmax(Z))
     start = np.ceil(zmin / interval) * interval
     line_levels = np.arange(start, zmax, interval)
@@ -925,9 +1224,9 @@ function renderFillLegend(zmin, zmax, colors) {{
   if (!div) {{ return; }}
   var nTicks = 5;
   // Градиент строим из реальных цветов диапазонов заливки (а не заново по
-  // hue 220→0) — иначе 2-стопный CSS-градиент интерполируется в RGB и не
+  // hue 0→220) — иначе 2-стопный CSS-градиент интерполируется в RGB и не
   // совпадает с фактической последовательностью цветов на карте.
-  var stops = (colors && colors.length) ? colors.join(', ') : 'hsl(220,75%,50%), hsl(0,75%,50%)';
+  var stops = (colors && colors.length) ? colors.join(', ') : 'hsl(0,75%,50%), hsl(220,75%,50%)';
   var barHtml = '<div class="bar-wrap"><div class="bar" style="background:' +
     'linear-gradient(to top, ' + stops + ')"></div>';
   var scaleHtml = '<div class="scale">';
@@ -1012,7 +1311,13 @@ function drawIsobaths(payload) {{
   }});
 
   (payload.lines || []).forEach(function (c) {{
-    L.polyline(c.coords, {{color: lineColor, weight: lineWidth}}).addTo(linesLayer);
+    // Изобаты на целых метрах — чёрным и непрозрачно (как «жирные» опорные
+    // линии на морских картах), промежуточные (дробный шаг изобат) — обычным
+    // выбранным цветом, но на 50% прозрачнее, чтобы не спорили с целыми.
+    var isWhole = Math.abs(c.level - Math.round(c.level)) < 0.01;
+    var segColor = isWhole ? '#000000' : lineColor;
+    var segOpacity = isWhole ? 1.0 : 0.5;
+    L.polyline(c.coords, {{color: segColor, weight: lineWidth, opacity: segOpacity}}).addTo(linesLayer);
     for (var i = 0; i < c.coords.length; i += labelFreq) {{
       var text = c.level.toFixed(1);
       if (shouldPlaceLabel(text, c.coords[i])) {{
@@ -1044,7 +1349,7 @@ def build_isobaths_js(result, style):
     payload["bands"] = []
     for i, b in enumerate(bands):
         t = i / max(1, n - 1)
-        color = f"hsl({int(220 - 220 * t)},75%,50%)"
+        color = f"hsl({int(220 * t)},75%,50%)"
         payload["bands"].append(dict(lo=b["lo"], hi=b["hi"], rings=b["rings"], color=color))
     return f"drawIsobaths({json.dumps(payload)});"
 
@@ -1071,15 +1376,44 @@ def compute_time_offset(sl2_path, gnss_paths):
     # синхронизирован, отдаём и уточнённые начало/конец записи.
     start_utc = datetime.utcfromtimestamp(float(t_abs.min()))
     end_utc = datetime.utcfromtimestamp(float(t_abs.max()))
+    span_s = float(s["t_rel"][-1] - s["t_rel"][0])
+
+    depth_before = s["depth_m"][has_gps]
+    depth_after = s["depth_m"][ok]
+    depth_valid = s["depth_m"][np.isfinite(s["depth_m"]) & (s["depth_m"] > 0)]
+    depth_vmin = float(np.nanmin(depth_valid)) if len(depth_valid) else 0.0
+    depth_vmax = float(np.nanmax(depth_valid)) if len(depth_valid) else 1.0
+    # has_gps и ok — разные маски по одному и тому же массиву пингов (has_gps —
+    # был ли валиден встроенный GPS Lowrance у пинга, ok — нашлась ли для пинга
+    # интерполированная позиция на GNSS-треке после синхронизации), поэтому
+    # точка i массива "before" и точка i массива "after" — не обязательно один
+    # и тот же пинг. Отдаём настоящий номер пинга (позицию в полном массиве)
+    # для каждой точки — по нему в GUI ищется ближайшее совпадение при
+    # подсветке одной и той же точки на обеих картах сравнения.
+    ping_idx_before = np.flatnonzero(has_gps)
+    ping_idx_after = np.flatnonzero(ok)
+
     return dict(
         offset_s=tm["a"], rms_pos=tm.get("rms_pos"),
+        # Подробности расчёта — для детального отчёта в OffsetDialog: грубое
+        # смещение и качество кросс-корреляции скорости (NCC), дрейф часов
+        # эхолота (ppm и секунды за запись, по скольким окнам с поворотами
+        # оценён — 0, если окон не хватило, см. estimate_time_model), и была
+        # ли уточнённая точка на краю окна поиска (edge=True — возможно,
+        # ненадёжно, стоит проверить).
+        coarse_offset_s=tm.get("coarse"), ncc=tm.get("ncc"),
+        drift_ppm=tm.get("b", 0.0) * 1e6, drift_s=tm.get("b", 0.0) * span_s,
+        drift_windows=tm.get("drift_windows", 0), edge=tm.get("edge"),
         start=start_utc.isoformat(), end=end_utc.isoformat(),
         duration_s=(end_utc - start_utc).total_seconds(),
+        depth_vmin=depth_vmin, depth_vmax=depth_vmax,
         before=dict(
-            sl2=dict(lat=s["lat"][has_gps].tolist(), lon=s["lon"][has_gps].tolist()),
+            sl2=dict(lat=s["lat"][has_gps].tolist(), lon=s["lon"][has_gps].tolist(),
+                     depth=depth_before.tolist(), ping_idx=ping_idx_before.tolist()),
             gnss=dict(lat=g["lat"].tolist(), lon=g["lon"].tolist())),
         after=dict(
-            sl2=dict(lat=lat2.tolist(), lon=lon2.tolist()),
+            sl2=dict(lat=lat2.tolist(), lon=lon2.tolist(), depth=depth_after.tolist(),
+                     ping_idx=ping_idx_after.tolist()),
             gnss=dict(lat=g["lat"].tolist(), lon=g["lon"].tolist())),
     )
 
@@ -1089,9 +1423,10 @@ class DepthRulerWidget(QWidget):
     прокрутки, чтобы не уезжать вместе с картинкой. По вертикали синхронизируется
     со скроллом канваса (see EchogramViewDialog).
 
-    Показывает номер байта от начала пинга, а не глубину в метрах: реальный
-    диапазон сонара на байт неизвестен (см. build_echogram_image), выдавать
-    здесь метры значило бы обманывать точностью, которой на самом деле нет."""
+    Показывает глубину в метрах, если эхограмма откалибрована по полю диапазона
+    сонара (range_m, см. build_echogram_image) — так почти всегда, кроме случая,
+    когда это поле не удалось прочитать; тогда, как раньше, показывается номер
+    байта от начала пинга без домысленной привязки к метрам."""
     WIDTH = 55
 
     def __init__(self, canvas):
@@ -1100,11 +1435,13 @@ class DepthRulerWidget(QWidget):
         self.setFixedWidth(self.WIDTH)
         self.row_count = 0
         self.content_height = 0
+        self.range_m = None
         self.scroll_y = 0
 
-    def set_params(self, row_count, content_height):
+    def set_params(self, row_count, content_height, range_m=None):
         self.row_count = row_count
         self.content_height = content_height
+        self.range_m = range_m
         self.update()
 
     def set_scroll_offset(self, y):
@@ -1126,7 +1463,11 @@ class DepthRulerWidget(QWidget):
                 continue
             row = (y_content / self.content_height) * self.row_count
             painter.drawLine(self.WIDTH - 5, int(y_viewport), self.WIDTH, int(y_viewport))
-            painter.drawText(2, min(int(y_viewport) + 4, h - 2), f"{row:.0f}")
+            if self.range_m is not None:
+                label = f"{row / self.row_count * self.range_m:.1f}"
+            else:
+                label = f"{row:.0f}"
+            painter.drawText(2, min(int(y_viewport) + 4, h - 2), label)
 
     def wheelEvent(self, event):
         self.canvas.wheelEvent(event)
@@ -1201,6 +1542,7 @@ class EchogramCanvas(QWidget):
         self.valid = None
         self.image = None
         self.depth_m = []
+        self.range_m = None
         self.axis_vals = []
         self.axis_mode = "time"
         self.zoom = 1.0
@@ -1208,10 +1550,11 @@ class EchogramCanvas(QWidget):
         self.hover_pos = None
         self.setMouseTracking(True)
 
-    def set_data(self, arr, valid, depth_m, axis_vals, axis_mode):
+    def set_data(self, arr, valid, depth_m, axis_vals, axis_mode, range_m=None):
         self.arr = arr
         self.valid = valid
         self.depth_m = depth_m
+        self.range_m = range_m
         self.axis_vals = axis_vals or list(range(arr.shape[1]))
         self.axis_mode = axis_mode
         self._rebuild_image()
@@ -1227,24 +1570,33 @@ class EchogramCanvas(QWidget):
     def _rebuild_image(self):
         if self.arr is None:
             return
-        adj = np.clip((self.arr.astype(np.float32) - 128.0) * self.contrast + 128.0, 0, 255)
-        self.image = colorize_echogram(adj.astype(np.uint8), self.valid)
+        # При уменьшении масштаба сначала огрубляем усреднением по блокам (см.
+        # block_reduce_mean) — иначе на отрисовке эхограммы образуется алиасинг
+        # (зубчатые вертикальные полосы) вместо гладкой картины, которая видна
+        # при масштабе 1:1. При zoom >= 1 показываем как есть, пиксель в пиксель
+        # (или крупнее — тут дробление не нужно).
+        factor = max(1, round(1.0 / self.zoom)) if self.zoom < 1 else 1
+        arr, valid = block_reduce_mean(self.arr, self.valid, factor, factor)
+        adj = np.clip((arr.astype(np.float32) - 128.0) * self.contrast + 128.0, 0, 255)
+        self.image = colorize_echogram(adj.astype(np.uint8), valid)
 
     def sizeHint(self):
-        if self.image is None:
+        if self.arr is None:
             return QSize(400, 200)
-        return QSize(int(self.image.width() * self.zoom),
-                     int(self.image.height() * self.zoom) + self.AXIS_H)
+        rows, cols = self.arr.shape
+        return QSize(int(cols * self.zoom), int(rows * self.zoom) + self.AXIS_H)
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("black"))
-        if self.image is None:
+        if self.image is None or self.arr is None:
             painter.setPen(QColor("white"))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Чтение файла…")
             return
-        w = int(self.image.width() * self.zoom)
-        h = int(self.image.height() * self.zoom)
+        rows, cols = self.arr.shape
+        w = int(cols * self.zoom)
+        h = int(rows * self.zoom)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         painter.drawImage(QRect(0, 0, w, h), self.image)
         self._draw_axis(painter, w, h)
         if self.hover_pos is not None:
@@ -1257,25 +1609,30 @@ class EchogramCanvas(QWidget):
         painter.setPen(QColor(255, 255, 0, 200))
         painter.drawLine(0, int(y), w, int(y))
         painter.drawLine(int(x), 0, int(x), h)
-        row = y / h * self.image.height() if h else 0
+        row = y / h * self.arr.shape[0] if h else 0
         col = int(x / w * len(self.axis_vals)) if w and self.axis_vals else 0
         col = max(0, min(len(self.axis_vals) - 1, col)) if self.axis_vals else 0
-        row_label = f"{row:.0f}"
+        if self.range_m is not None:
+            row_label = f"{row / self.arr.shape[0] * self.range_m:.1f} м"
+            row_box_w = 44
+        else:
+            row_label = f"{row:.0f}"
+            row_box_w = 34
         col_label = format_axis_label(self.axis_vals[col], self.axis_mode) if self.axis_vals else ""
         painter.setBrush(QColor(255, 255, 0, 220))
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawRect(2, max(0, int(y) - 14), 34, 14)
+        painter.drawRect(2, max(0, int(y) - 14), row_box_w, 14)
         painter.drawRect(min(w - 46, int(x) + 2), 2, 44, 14)
         painter.setPen(QColor("black"))
         painter.drawText(4, max(11, int(y) - 3), row_label)
         painter.drawText(min(w - 44, int(x) + 4), 13, col_label)
 
     def mouseMoveEvent(self, event):
-        if self.image is None:
+        if self.image is None or self.arr is None:
             return
         pos = event.position() if hasattr(event, "position") else event.pos()
         self.hover_pos = (pos.x(), pos.y())
-        w = int(self.image.width() * self.zoom)
+        w = int(self.arr.shape[1] * self.zoom)
         col = int(pos.x() / w * len(self.axis_vals)) if w and self.axis_vals else None
         if col is not None:
             col = max(0, min(len(self.axis_vals) - 1, col))
@@ -1305,6 +1662,7 @@ class EchogramCanvas(QWidget):
             return
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
         self.zoom = max(0.1, min(20.0, self.zoom * factor))
+        self._rebuild_image()
         self.updateGeometry()
         self.resize(self.sizeHint())
         self.update()
@@ -1359,16 +1717,17 @@ class EchogramViewDialog(QDialog):
                   on_finished=self.on_loaded, on_error=self.on_error)
 
     def sync_side_widgets(self):
-        if self.canvas.image is None:
+        if self.canvas.image is None or self.canvas.arr is None:
             return
-        row_count = self.canvas.image.height()
-        content_height = int(self.canvas.image.height() * self.canvas.zoom)
-        self.ruler.set_params(row_count, content_height)
-        content_width = int(self.canvas.image.width() * self.canvas.zoom)
+        rows, cols = self.canvas.arr.shape
+        row_count = rows
+        content_height = int(rows * self.canvas.zoom)
+        self.ruler.set_params(row_count, content_height, self.canvas.range_m)
+        content_width = int(cols * self.canvas.zoom)
         self.echo_timeline.set_params(self.canvas.depth_m, content_width)
 
     def on_loaded(self, data):
-        arr, valid = build_echogram_image(data["records"], data["depth_m"])
+        arr, valid, cal_range = build_echogram_image(data["records"], data["range_m"])
         if arr is None:
             self.status_label.setText("В файле нет данных эхограммы")
             return
@@ -1376,10 +1735,13 @@ class EchogramViewDialog(QDialog):
         if data["mixed_freqs"] > 1:
             note = (f" — в канале {data['mixed_freqs']} частоты, показана самая частая, "
                     f"остальные пинги пропущены")
+        if cal_range is not None:
+            note += (f"; глубина откалибрована по диапазону сонара "
+                      f"(0–{cal_range:.1f} м)")
         self.status_label.setText(f"{arr.shape[1]} пингов, {arr.shape[0]} байт по глубине "
                                    f"(колесо мыши — масштаб){note}")
         axis_vals = data["dist"] if self.axis_mode == "distance" else data["t_rel"]
-        self.canvas.set_data(arr, valid, data["depth_m"], axis_vals, self.axis_mode)
+        self.canvas.set_data(arr, valid, data["depth_m"], axis_vals, self.axis_mode, cal_range)
         self.sync_side_widgets()
 
     def on_error(self, message):
@@ -1398,6 +1760,29 @@ class MapClickBridge(QObject):
     @Slot(float, float)
     def mapClicked(self, lat, lon):
         self.on_click(lat, lon)
+
+
+class TrackCompareBridge(QObject):
+    """Мост QWebChannel между двумя картами сравнения треков (OffsetDialog,
+    build_tracks_html с sync=True): движение и наведение на точку на одной
+    карте транслируется на вторую через runJavaScript — сами карты это две
+    разные страницы в разных QWebEngineView, без прямой связи между JS."""
+
+    def __init__(self, other_view_getter):
+        super().__init__()
+        self._other = other_view_getter
+
+    @Slot(float, float, float)
+    def viewChanged(self, lat, lng, zoom):
+        self._other().page().runJavaScript(f"syncView({lat}, {lng}, {zoom});")
+
+    @Slot(int)
+    def hoverPoint(self, idx):
+        self._other().page().runJavaScript(f"remoteHighlight({idx});")
+
+    @Slot()
+    def hoverEnd(self):
+        self._other().page().runJavaScript("remoteHighlight(-1);")
 
 
 class IsobathsDialog(QDialog):
@@ -1455,6 +1840,9 @@ class IsobathsDialog(QDialog):
 
         load_waterline_btn = QPushButton("Загрузить урез из файла")
         load_waterline_btn.clicked.connect(self.load_waterline_from_file)
+        load_waterline_row = QHBoxLayout()
+        load_waterline_row.addWidget(load_waterline_btn, 1)
+        load_waterline_row.addWidget(help_icon(WATERLINE_FILE_HELP))
 
         self.draw_btn = QPushButton("Нарисовать урез воды")
         self.draw_btn.setCheckable(True)
@@ -1549,7 +1937,7 @@ class IsobathsDialog(QDialog):
         settings_layout.addLayout(interval_row)
         settings_layout.addLayout(cell_row)
         settings_layout.addLayout(smooth_row)
-        settings_layout.addWidget(load_waterline_btn)
+        settings_layout.addLayout(load_waterline_row)
         settings_layout.addWidget(self.draw_btn)
         settings_layout.addWidget(clear_waterline_btn)
         settings_layout.addWidget(self.waterline_label)
@@ -1712,36 +2100,143 @@ class OffsetDialog(QDialog):
     def __init__(self, parent, basemap, result):
         super().__init__(parent)
         self.setWindowTitle("Сравнение треков до/после синхронизации")
-        self.resize(1400, 800)
+        self.resize(1400, 850)
 
-        info = f"Смещение времени: {result['offset_s']:+.3f} с"
+        report_box = QGroupBox("Детали расчёта смещения")
+        report_form = QFormLayout()
+        report_form.addRow(
+            label_with_help(
+                "Смещение (уточнённое):",
+                "Итоговое смещение времени между часами эхолота и GNSS-приёмником, "
+                "секунды. Прибавляется к относительному времени пинга sl2, чтобы "
+                "получить настоящее UTC-время. Найдено уточнением по траектории "
+                "после грубой оценки по кросс-корреляции скорости (см. ниже)."),
+            QLabel(f"{result['offset_s']:+.3f} с"))
+
+        coarse, ncc = result.get("coarse_offset_s"), result.get("ncc")
+        if coarse is not None and ncc is not None:
+            if ncc < 0.5:
+                qual = "слабая — проверьте, что записи с одного выхода"
+            elif ncc < 0.7:
+                qual = "средняя"
+            else:
+                qual = "хорошая"
+            report_form.addRow(
+                label_with_help(
+                    "Грубое смещение (по скорости):",
+                    "Первая, приближённая оценка смещения — по максимуму "
+                    "кросс-корреляции профилей скорости GNSS-трека и встроенного "
+                    "GPS Lowrance. NCC (normalized cross-correlation) — качество "
+                    "совпадения профилей, от 0 до 1: чем выше, тем увереннее "
+                    "найдено смещение. От этой точки идёт дальнейшее уточнение."),
+                QLabel(f"{coarse:+.2f} с, корреляция {ncc:.2f} ({qual})"))
+
         if result.get("rms_pos") is not None:
-            info += f"    СКО позиций после синхронизации: {result['rms_pos']:.2f} м"
+            report_form.addRow(
+                label_with_help(
+                    "СКО позиций после синхронизации:",
+                    "Среднеквадратичное отклонение между положениями встроенного "
+                    "GPS Lowrance и GNSS-трека после применения найденного "
+                    "смещения — грубая оценка того, насколько хорошо совпали "
+                    "треки, в метрах. Это ошибка позиционирования (зависит от "
+                    "качества GPS-фикса), а не ошибка глубины."),
+                QLabel(f"{result['rms_pos']:.2f} м"))
 
+        if result.get("edge"):
+            edge_lbl = QLabel("⚠ уточнённая точка на краю окна поиска — возможно, "
+                               "истинное смещение вне проверенного диапазона")
+            edge_lbl.setStyleSheet("color: #d9822b;")
+            report_form.addRow(
+                label_with_help(
+                    "",
+                    "Уточнение смещения ищет минимум СКО позиций в окне ±1.5 с "
+                    "вокруг грубой оценки. Если найденная точка оказалась на "
+                    "самом краю этого окна, значит минимум мог быть не пойман "
+                    "целиком — стоит перепроверить результат вручную (например, "
+                    "через --offset в sl2sync.py с ручным перебором)."),
+                edge_lbl)
+
+        drift_windows = result.get("drift_windows", 0)
+        drift_help = (
+            "Изменение скорости хода часов эхолота относительно GNSS за время "
+            "записи (в миллионных долях, ppm) — оценивается по нескольким "
+            "окнам записи с поворотами (на прямом галсе смещение по времени "
+            "ненаблюдаемо). Это отдельная, обычно небольшая поправка сверх "
+            "смещения выше — она накапливается пропорционально времени от "
+            "середины записи, а не постоянна."
+        )
+        if drift_windows >= 3:
+            report_form.addRow(
+                label_with_help("Дрейф часов эхолота:", drift_help),
+                QLabel(f"{result.get('drift_ppm', 0.0):+.1f} ppm "
+                       f"({result.get('drift_s', 0.0):+.2f} с за запись), окон: {drift_windows}"))
+        else:
+            report_form.addRow(
+                label_with_help("Дрейф часов эхолота:", drift_help),
+                QLabel("не оценивался — мало окон с поворотами "
+                       "(нужна запись > 10–15 мин)"))
+
+        if result.get("start") and result.get("end"):
+            start_str = datetime.fromisoformat(result["start"]).strftime("%d.%m.%Y %H:%M:%S")
+            end_str = datetime.fromisoformat(result["end"]).strftime("%d.%m.%Y %H:%M:%S")
+            report_form.addRow(
+                label_with_help(
+                    "Начало/конец записи (по GNSS):",
+                    "Абсолютное время начала и конца записи в UTC, вычисленное "
+                    "через найденное смещение и относительное время sl2 — "
+                    "точнее, чем время изменения файла на диске (mtime) или "
+                    "служебное поле в самом sl2 (см. документацию проекта)."),
+                QLabel(f"{start_str} — {end_str} UTC"))
+
+        report_form.addRow(
+            label_with_help(
+                "Диапазон глубин на картах ниже:",
+                "Минимальная и максимальная глубина, по которой раскрашены точки "
+                "трека на картах ниже — единый диапазон для карт «до» и «после», "
+                "чтобы цвета были сравнимы между собой."),
+            QLabel(f"{result.get('depth_vmin', 0.0):.2f}–"
+                   f"{result.get('depth_vmax', 0.0):.2f} м "
+                   f"(минимум — красный, максимум — синий)"))
+        report_box.setLayout(report_form)
+
+        depth_vmin, depth_vmax = result.get("depth_vmin"), result.get("depth_vmax")
         left_view = new_map_view()
+        right_view = new_map_view()
+
+        # Мосты для синхронизации пана/зума и наведения между двумя картами —
+        # каждый мост знает только про "вторую" карту (см. TrackCompareBridge).
+        self.left_bridge = TrackCompareBridge(lambda: right_view)
+        self.left_channel = QWebChannel()
+        self.left_channel.registerObject("bridge", self.left_bridge)
+        left_view.page().setWebChannel(self.left_channel)
+
+        self.right_bridge = TrackCompareBridge(lambda: left_view)
+        self.right_channel = QWebChannel()
+        self.right_channel.registerObject("bridge", self.right_bridge)
+        right_view.page().setWebChannel(self.right_channel)
+
         load_html(left_view, build_tracks_html(basemap, [
             dict(name="Эхограмма (сырой GPS)", color="red", **result["before"]["sl2"]),
             dict(name="GNSS-трек", color="blue", **result["before"]["gnss"]),
-        ]), "before")
-        right_view = new_map_view()
+        ], depth_vmin=depth_vmin, depth_vmax=depth_vmax, sync=True), "before")
         load_html(right_view, build_tracks_html(basemap, [
             dict(name="Эхограмма (синхр.)", color="red", **result["after"]["sl2"]),
             dict(name="GNSS-трек", color="blue", **result["after"]["gnss"]),
-        ]), "after")
+        ], depth_vmin=depth_vmin, depth_vmax=depth_vmax, sync=True), "after")
 
         left_col = QVBoxLayout()
         left_col.addWidget(QLabel("До синхронизации"))
-        left_col.addWidget(left_view)
+        left_col.addWidget(left_view, 1)
         right_col = QVBoxLayout()
         right_col.addWidget(QLabel("После синхронизации"))
-        right_col.addWidget(right_view)
+        right_col.addWidget(right_view, 1)
         maps_row = QHBoxLayout()
-        maps_row.addLayout(left_col)
-        maps_row.addLayout(right_col)
+        maps_row.addLayout(left_col, 1)
+        maps_row.addLayout(right_col, 1)
 
         layout = QVBoxLayout()
-        layout.addWidget(QLabel(info))
-        layout.addLayout(maps_row)
+        layout.addWidget(report_box)
+        layout.addLayout(maps_row, 1)
         self.setLayout(layout)
 
 
@@ -1917,7 +2412,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(f"ОМДЖЕТ Гидро v{APP_VERSION}")
         self.setWindowIcon(QIcon(ICON_PATH))
-        self.resize(1100, 1000)
+        self.resize(1300, 1000)
         self.settings = QSettings("sl2sync", "gui")
         QWebEngineProfile.defaultProfile().setHttpCacheMaximumSize(
             int(self.settings.value("cache_max_mb", 1024)) * 1024 * 1024)
@@ -1944,6 +2439,7 @@ class MainWindow(QMainWindow):
         close_echograms_btn.clicked.connect(self.close_echograms)
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("Файл эхограммы (.sl2):"))
+        row1.addWidget(help_icon(SL2_FILE_HELP))
         row1.addWidget(self.sl2_edit, 1)
         row1.addWidget(sl2_btn)
         row1.addWidget(view_echogram_btn)
@@ -1953,6 +2449,7 @@ class MainWindow(QMainWindow):
         row1.addWidget(close_echograms_btn)
 
         self.gnss_paths = []
+        self.gnss_track = None
         self.gnss_edit = QLineEdit(readOnly=True)
         gnss_btn = QPushButton("Обзор…")
         gnss_btn.clicked.connect(self.pick_gnss)
@@ -1968,6 +2465,7 @@ class MainWindow(QMainWindow):
         close_gnss_btn.clicked.connect(self.close_gnss)
         row2 = QHBoxLayout()
         row2.addWidget(QLabel("GNSS-трек:"))
+        row2.addWidget(help_icon(GNSS_FILE_HELP))
         row2.addWidget(self.gnss_edit, 1)
         row2.addWidget(gnss_btn)
         row2.addWidget(sep2a)
@@ -2107,6 +2605,8 @@ class MainWindow(QMainWindow):
         self.basemap_combo = QComboBox()
         self.basemap_combo.addItems(BASEMAPS.keys())
         self.basemap_combo.currentTextChanged.connect(self.redraw_map)
+        self.hide_gnss_check = QCheckBox("Скрыть GNSS трек")
+        self.hide_gnss_check.toggled.connect(self.redraw_map)
         self.hide_endpoints_check = QCheckBox("Скрыть начало/конец треков")
         self.hide_endpoints_check.toggled.connect(self.redraw_map)
         self.show_speed_track_check = QCheckBox("Скорость на треке")
@@ -2117,6 +2617,9 @@ class MainWindow(QMainWindow):
         sep_row3a = QFrame()
         sep_row3a.setFrameShape(QFrame.Shape.VLine)
         sep_row3a.setFrameShadow(QFrame.Shadow.Sunken)
+        sep_row3a2 = QFrame()
+        sep_row3a2.setFrameShape(QFrame.Shape.VLine)
+        sep_row3a2.setFrameShadow(QFrame.Shadow.Sunken)
         sep_row3b = QFrame()
         sep_row3b.setFrameShape(QFrame.Shape.VLine)
         sep_row3b.setFrameShadow(QFrame.Shadow.Sunken)
@@ -2124,6 +2627,8 @@ class MainWindow(QMainWindow):
         row3.addWidget(QLabel("Фотоподложка:"))
         row3.addWidget(self.basemap_combo, 1)
         row3.addWidget(sep_row3a)
+        row3.addWidget(self.hide_gnss_check)
+        row3.addWidget(sep_row3a2)
         row3.addWidget(self.hide_endpoints_check)
         row3.addWidget(self.show_speed_track_check)
         row3.addWidget(sep_row3b)
@@ -2177,12 +2682,13 @@ class MainWindow(QMainWindow):
 
     def pick_gnss(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "GNSS-трек", self.last_dir(), "GNSS-трек (*.nmea *.pos *.csv);;Все файлы (*)")
+            self, "GNSS-трек", self.last_dir(), "GNSS-трек (*.nmea *.pos *.csv *.ubx);;Все файлы (*)")
         if path:
             self.remember_dir(path)
             self.gnss_paths = [path]
             self.gnss_edit.setText(path)
             self.update_offset_enabled()
+            self.reload_gnss_track()
 
     def pick_multi_gnss(self):
         self.gnss_paths = []
@@ -2190,18 +2696,39 @@ class MainWindow(QMainWindow):
 
     def _pick_next_gnss_file(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "GNSS-трек", self.last_dir(), "GNSS-трек (*.nmea *.pos *.csv);;Все файлы (*)")
+            self, "GNSS-трек", self.last_dir(), "GNSS-трек (*.nmea *.pos *.csv *.ubx);;Все файлы (*)")
         if not path:
             return
         self.remember_dir(path)
         self.gnss_paths.append(path)
         self.gnss_edit.setText("; ".join(self.gnss_paths))
         self.update_offset_enabled()
+        self.reload_gnss_track()
         reply = QMessageBox.question(
             self, "Мультитрек", "Загрузить ещё один GNSS-трек?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             self._pick_next_gnss_file()
+
+    def reload_gnss_track(self):
+        """Фоновая загрузка GNSS-трека для отображения на карте (тонкой красной
+        линией) — отдельно от read_gnss внутри compute_time_offset, т.к. точки
+        нужны на карте сразу после загрузки файла, ещё до расчёта смещения."""
+        if not self.gnss_paths:
+            self.gnss_track = None
+            self.redraw_map()
+            return
+        run_async(lambda: read_gnss_track_points(list(self.gnss_paths)),
+                  on_finished=self.on_gnss_track_loaded, on_error=self.on_gnss_track_error)
+
+    def on_gnss_track_loaded(self, track):
+        self.gnss_track = track
+        self.redraw_map()
+
+    def on_gnss_track_error(self, message):
+        self.gnss_track = None
+        self.statusBar().showMessage(f"Не удалось прочитать GNSS-трек для показа на карте: {message}")
+        self.redraw_map()
 
     def close_echograms(self):
         self.file_data = []
@@ -2214,8 +2741,10 @@ class MainWindow(QMainWindow):
 
     def close_gnss(self):
         self.gnss_paths = []
+        self.gnss_track = None
         self.gnss_edit.setText("")
         self.update_offset_enabled()
+        self.redraw_map()
         self.statusBar().showMessage("GNSS-трек закрыт")
 
     def pick_multi_sl2(self):
@@ -2238,7 +2767,11 @@ class MainWindow(QMainWindow):
         self.settings.setValue("last_dir", os.path.dirname(file_path))
 
     def update_offset_enabled(self):
-        self.offset_btn.setEnabled(bool(self.sl2_edit.text() and self.gnss_paths))
+        # Расчёт смещения работает только с одним файлом эхограммы — при
+        # мультиэхограмме self.sl2_edit хранит пути через "; ", это не валидный
+        # путь для read_sl2 (раньше падало необработанным OSError при клике).
+        path = self.sl2_edit.text()
+        self.offset_btn.setEnabled(bool(path) and ";" not in path and bool(self.gnss_paths))
 
     def load_file(self, path, ask_more):
         self.statusBar().showMessage("Чтение файла…")
@@ -2421,7 +2954,9 @@ class MainWindow(QMainWindow):
                                show_endpoints=not self.hide_endpoints_check.isChecked(),
                                show_speed_track=self.show_speed_track_check.isChecked(),
                                track_width=int(self.settings.value("track_line_width", 3)),
-                               speed_glow_width=int(self.settings.value("speed_glow_width", 12)))
+                               speed_glow_width=int(self.settings.value("speed_glow_width", 12)),
+                               gnss_track=(self.gnss_track if not self.hide_gnss_check.isChecked()
+                                           else None))
         load_html(self.map_view, html, "main")
 
     def open_settings(self):
@@ -2455,9 +2990,16 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Обновления", f"Не удалось проверить обновления:\n{message}")
 
     def calc_offset(self):
+        path = self.sl2_edit.text()
+        if not path or ";" in path:
+            QMessageBox.information(
+                self, "Расчёт смещения",
+                "Расчёт смещения работает только с одним файлом эхограммы (не с "
+                "мультиэхограммой) — выберите один файл (кнопка «Обзор…»).")
+            return
         self.offset_btn.setEnabled(False)
         self.statusBar().showMessage("Вычисление смещения…")
-        run_async(lambda: compute_time_offset(self.sl2_edit.text(), self.gnss_paths),
+        run_async(lambda: compute_time_offset(path, self.gnss_paths),
                   on_finished=self.on_offset_finished, on_error=self.on_offset_error)
 
     def on_offset_finished(self, result):

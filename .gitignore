@@ -9,6 +9,7 @@ venv/
 *.sl3
 *.nmea
 *.pos
+*.ubx
 *_out/
 truth.json
 
@@ -17,10 +18,15 @@ truth.json
 !examples/data/*.sl3
 !examples/data/*.nmea
 !examples/data/*.pos
+!examples/data/*.ubx
 
-# слишком большие для обычного git push (>100 МБ, лимит GitHub) — только локально
+# слишком большие для обычного git push (>100 МБ, лимит GitHub, или просто
+# нецелесообразно раздувать репозиторий) — только локально
 examples/data/Sonar_01_Gorodok_2026-05-26_10.35.05.sl2
 examples/data/Sonar_02_Gorodok_2026-05-26_11.09.05.sl2
+examples/data/Sonar_2024-08-08_09.42.04.sl2
+examples/data/Base_20240808094251.ubx
+examples/data/Rover_20240808094341.ubx
 
 # журналы фоновых тестовых запусков gui.py
 gui_run*.log
