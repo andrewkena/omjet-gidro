@@ -1,3 +1,4 @@
+
 # sl2sync — привязка глубин Lowrance .sl2 к точному GNSS
 
 Контекст задачи, формат sl2, алгоритм и планы: [docs/CONTEXT.md](docs/CONTEXT.md).
