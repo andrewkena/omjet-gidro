@@ -5,7 +5,7 @@ a = Analysis(
     ['gui.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('assets/gidro.ico', 'assets')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

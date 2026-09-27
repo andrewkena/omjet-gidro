@@ -3,5 +3,6 @@ scipy
 pyproj
 matplotlib
 PySide6
+pandas
 # опционально, для GeoTIFF:
 # rasterio

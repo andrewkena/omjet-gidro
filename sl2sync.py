@@ -482,9 +482,17 @@ def read_gnss(path, fmt="auto", force_date=None):
 # ============================================================================
 # Вспомогательное
 # ============================================================================
-def make_proj(lon0, lat0):
-    zone = int((lon0 + 180) // 6) + 1
-    crs = CRS.from_epsg((32600 if lat0 >= 0 else 32700) + zone)
+def make_proj(lon0, lat0, crs_def=None):
+    """crs_def: None — автоподбор зоны UTM по WGS84 (по умолчанию); иначе —
+    EPSG-код (int или строка из цифр) или proj4-строка местной системы
+    координат (например, МСК)."""
+    if crs_def is None:
+        zone = int((lon0 + 180) // 6) + 1
+        crs = CRS.from_epsg((32600 if lat0 >= 0 else 32700) + zone)
+    elif isinstance(crs_def, int) or (isinstance(crs_def, str) and crs_def.strip().isdigit()):
+        crs = CRS.from_epsg(int(crs_def))
+    else:
+        crs = CRS.from_user_input(crs_def)
     fwd = Transformer.from_crs(4326, crs, always_xy=True)
     inv = Transformer.from_crs(crs, 4326, always_xy=True)
     return crs, fwd, inv
@@ -815,6 +823,8 @@ def build_parser():
     p.add_argument("sl2", help="файл эхолота .sl2")
     p.add_argument("gnss", help="GNSS-трек: NMEA-лог, RTKLIB .pos, CSV или UBX (u-blox binary)")
     p.add_argument("-o", "--out", help="папка результатов (по умолчанию <имя_sl2>_out)")
+    p.add_argument("--crs", help="система координат для колонок E/N и грида: EPSG-код "
+                                  "или proj4-строка (по умолчанию — автоподбор зоны UTM WGS84)")
     p.add_argument("--gnss-format", default="auto", choices=["auto", "nmea", "pos", "csv", "ubx"])
     p.add_argument("--date", help="дата UTC для NMEA без RMC/ZDA, ГГГГ-ММ-ДД")
     p.add_argument("--channel", type=int, help="канал sl2 (0 Primary, 1 Secondary, 2 DownScan)")
@@ -870,7 +880,14 @@ def run(args):
     g, gi = read_gnss(args.gnss, args.gnss_format, fd)
     log(f"  {gi['format']}: {gi['epochs']} эпох, {gi['rate_hz']} Гц, "
         f"RTK FIX {gi['fix_share'] * 100:.0f}%")
-    crs, fwd, inv = make_proj(float(np.median(g["lon"])), float(np.median(g["lat"])))
+    crs, fwd, inv = make_proj(float(np.median(g["lon"])), float(np.median(g["lat"])),
+                              getattr(args, "crs", None))
+    epsg = crs.to_epsg()
+    # crs_label — необязательное человекочитаемое имя для систем без EPSG-кода
+    # (например, местных МСК, заданных proj4-строкой) — задаётся вызывающей
+    # стороной (GUI), т.к. pyproj для них возвращает crs.name == "unknown".
+    crs_label = getattr(args, "crs_label", None) or (f"EPSG:{epsg}" if epsg else crs.name)
+    log(f"  система координат: {crs_label}")
     g["E"], g["N"] = fwd.transform(g["lon"], g["lat"])
     s["E_low"], s["N_low"] = fwd.transform(s["lon"], s["lat"])
     mot = gnss_motion(g, args.grid_dt, args.max_gap, min_speed=0.3)
@@ -929,7 +946,8 @@ def run(args):
         "time_utc": [datetime.fromtimestamp(t, timezone.utc).isoformat(timespec="milliseconds")
                      .replace("+00:00", "Z") for t in t_abs[sel]],
         "lat": np.round(lat[sel], 8), "lon": np.round(lon[sel], 8),
-        f"E_{crs.to_epsg()}": np.round(E[sel], 3), f"N_{crs.to_epsg()}": np.round(N[sel], 3),
+        (f"E_{epsg}" if epsg else "E_local"): np.round(E[sel], 3),
+        (f"N_{epsg}" if epsg else "N_local"): np.round(N[sel], 3),
         "depth_m": np.round(d_tot[sel], 3),
     }
     if z is not None:
@@ -945,7 +963,7 @@ def run(args):
                           base + ("_zbottom" if z is not None else "_depth"))
         files += gf
 
-    res.update(sl2=si, gnss=gi, crs=f"EPSG:{crs.to_epsg()}", points=int(len(sel)),
+    res.update(sl2=si, gnss=gi, crs=crs_label, points=int(len(sel)),
                lever_fwd_right_m=args.lever, draft_m=args.draft,
                antenna_height_m=args.antenna_height,
                depth_range_m=[round(float(d_tot[sel].min()), 2),

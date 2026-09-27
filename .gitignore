@@ -27,11 +27,23 @@ examples/data/Sonar_02_Gorodok_2026-05-26_11.09.05.sl2
 examples/data/Sonar_2024-08-08_09.42.04.sl2
 examples/data/Base_20240808094251.ubx
 examples/data/Rover_20240808094341.ubx
+examples/data/20260522083739.cnb
+examples/data/M1_ST1_6695_Ubilenii_200924.24o
+examples/data/_8072681.GNS
+
+# рабочие папки PPK (RTKLIB demo5: convbin/rnx2rtkp) и их тестовые прогоны
+*_ppk_out/
+ppk_out_test/
 
 # журналы фоновых тестовых запусков gui.py
 gui_run*.log
 
-# сборка EXE (PyInstaller) — сам exe прикладывается к релизу на GitHub, не в git
+# сборка EXE (PyInstaller) и установщика (Inno Setup) — сами файлы
+# прикладываются к релизу на GitHub, не в git
 build/
 dist/
+installer_dist/
 pyinstaller_build.log
+
+# сторонние бинарники (RTKLIB demo5) — не в git
+tools/
