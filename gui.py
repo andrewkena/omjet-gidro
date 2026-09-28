@@ -31,15 +31,15 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QColorDial
                                 QFormLayout, QFrame, QGroupBox, QHBoxLayout, QInputDialog, QLabel,
                                 QLineEdit, QListWidget, QListWidgetItem, QMenu, QMainWindow, QMessageBox,
                                 QPushButton, QRadioButton, QScrollArea, QSlider, QSpinBox,
-                                QTabWidget, QTextBrowser, QTextEdit, QVBoxLayout, QWidget)
+                                QStackedWidget, QTabWidget, QTextBrowser, QTextEdit, QVBoxLayout, QWidget)
 
 from ppk_module import PPKConfig, PPKProcessor, is_rinex, rinex_obs_info
 from sl2sync import (build_parser, estimate_time_model, gnss_motion, make_proj,
                       ping_positions, read_gnss, read_sl2, read_ubx)
 from sl2sync import run as sl2sync_run
 
-APP_VERSION = "0.1.5"
-APP_VERSION_DATE = "2026-09-27"          # дата этой версии — обновлять вместе с APP_VERSION
+APP_VERSION = "0.1.6"
+APP_VERSION_DATE = "2026-09-28"          # дата этой версии — обновлять вместе с APP_VERSION
 GITHUB_REPO = "andrewkena/omjet-gidro"
 
 
@@ -209,8 +209,11 @@ GNSS_BASE_FILE_HELP = (
     "«PPK» — там свои, независимые от этого поля, списки файлов."
 )
 WATERLINE_FILE_HELP = (
-    "Точки уреза воды — CSV с колонками lat/lon (разделитель определяется\n"
-    "автоматически) либо обычный текст: на каждой строке два числа lat lon."
+    "Точки уреза/русла — CSV с колонками lat/lon (разделитель определяется\n"
+    "автоматически), обычный текст (на каждой строке два числа lat lon — все\n"
+    "такие точки считаются урезом) либо KML: цвет линии определяет тип —\n"
+    "оранжевая/красная — урез, голубая/синяя — русло; линии без стиля тоже\n"
+    "считаются урезом."
 )
 
 PPK_FILES_HELP = (
@@ -1031,6 +1034,7 @@ def read_echogram_waterfall(sl2_path):
     return dict(records=records, depth_m=s["depth_m"][m].tolist(),
                 range_m=s["range_m"][m].tolist(),
                 t_rel=s["t_rel"][m].tolist(),
+                lat=s["lat"][m].tolist(), lon=s["lon"][m].tolist(),
                 dist=cumulative_distance(s["lat"][m], s["lon"][m]),
                 mixed_freqs=mixed_freqs)
 
@@ -1219,12 +1223,76 @@ def read_gnss_track_points(gnss_paths):
     return dict(lat=g["lat"].tolist(), lon=g["lon"].tolist())
 
 
-def compute_isobaths(lat, lon, depth, waterline_points, cell, interval, fill_steps, smooth=0.0):
+def smooth_polyline_corners(points, iterations=2):
+    """Сглаживает острые углы нарисованной вручную линии (Chaikin corner-cutting):
+    начальная и конечная точки линии остаются на месте, внутренние углы —
+    скругляются. Меньше 3 точек — сглаживать нечего, возвращает как есть."""
+    pts = list(points)
+    if len(pts) < 3:
+        return pts
+    for _ in range(iterations):
+        smoothed = [pts[0]]
+        for i in range(len(pts) - 1):
+            p0, p1 = pts[i], pts[i + 1]
+            q = (0.75 * p0[0] + 0.25 * p1[0], 0.75 * p0[1] + 0.25 * p1[1])
+            r = (0.25 * p0[0] + 0.75 * p1[0], 0.25 * p0[1] + 0.75 * p1[1])
+            smoothed.extend([q, r])
+        smoothed.append(pts[-1])
+        pts = smoothed
+    return pts
+
+
+def _densify_polyline(xs, ys, step):
+    """Добавляет промежуточные точки вдоль ломаной (xs, ys — координаты в
+    проекции, метры) через каждые `step` — редкие клики мышью иначе оставляют
+    разрывы там, где нужна плотная опора (глубина=0 по всему урезу, а не
+    только в точках клика; «принудительная вода» вдоль русла)."""
+    xs, ys = np.asarray(xs, dtype=float), np.asarray(ys, dtype=float)
+    if len(xs) < 2:
+        return xs, ys
+    out_x, out_y = [xs[0]], [ys[0]]
+    for i in range(len(xs) - 1):
+        seg_len = float(np.hypot(xs[i + 1] - xs[i], ys[i + 1] - ys[i]))
+        steps = max(1, int(seg_len / step))
+        t = np.linspace(0.0, 1.0, steps + 1)[1:]
+        out_x.extend((xs[i] + t * (xs[i + 1] - xs[i])).tolist())
+        out_y.extend((ys[i] + t * (ys[i + 1] - ys[i])).tolist())
+    return np.array(out_x), np.array(out_y)
+
+
+def _build_terrain_mesh(GX, GY, Z, max_dim=120):
+    """Уменьшает грид глубин до разумного размера (для передачи в браузер и
+    отрисовки в Three.js — вкладка «3D дно») и переводит в локальные метры
+    относительно угла грида. Маскированные (NaN) ячейки остаются null — в
+    3D-сетке на их месте будет дырка, как и пустая область на 2D карте."""
+    ny, nx = Z.shape
+    stride = max(1, int(np.ceil(max(nx, ny) / max_dim)))
+    Zs = Z[::stride, ::stride]
+    Xs = GX[::stride, ::stride]
+    Ys = GY[::stride, ::stride]
+    x0, y0 = float(Xs[0, 0]), float(Ys[0, 0])
+    cell_x = float(Xs[0, 1] - Xs[0, 0])
+    cell_y = float(Ys[1, 0] - Ys[0, 0])
+    z_rows = [[(None if not np.isfinite(v) else round(float(v), 3)) for v in row] for row in Zs]
+    finite = Zs[np.isfinite(Zs)]
+    zmin = float(finite.min()) if finite.size else 0.0
+    zmax = float(finite.max()) if finite.size else 1.0
+    return dict(nx=int(Zs.shape[1]), ny=int(Zs.shape[0]), x0=x0, y0=y0,
+                cellX=cell_x, cellY=cell_y, z=z_rows, zmin=zmin, zmax=zmax)
+
+
+def compute_isobaths(lat, lon, depth, waterline_lines, cell, interval, fill_steps, smooth=0.0,
+                      channel_lines=None):
     """Грид глубин (линейная интерполяция) + линии постоянной глубины и залитые
-    диапазоны глубин через matplotlib.contour/contourf. Точки уреза воды
-    (нарисованные вручную, глубина 0) подмешиваются к данным эхолота — это
+    диапазоны глубин через matplotlib.contour/contourf. Точки линий уреза воды
+    (нарисованных вручную, глубина 0) подмешиваются к данным эхолота — это
     стандартный приём в батиметрии: сонар не измеряет вплотную к берегу,
-    а урез задаёт границу 0 м.
+    а урез задаёт границу 0 м. Линий уреза (`waterline_lines`) и линий русла
+    (`channel_lines`) может быть несколько — каждый параметр это список линий,
+    линия это список точек (lat, lon). Точки русла — тоже вспомогательные, но
+    глубина им не назначается фиксированной: берётся у ближайшего реального
+    промера, чтобы просто направить интерполяцию вдоль русла там, где
+    промеров мало, без выдумывания глубины.
 
     `smooth` — сигма гауссова размытия грида (в ячейках сетки) перед contour/
     contourf: сглаживает и линии, и заливку одинаково, т.к. обе строятся по
@@ -1240,13 +1308,45 @@ def compute_isobaths(lat, lon, depth, waterline_points, cell, interval, fill_ste
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.path import Path as MplPath
+    from scipy.spatial import cKDTree
 
-    lat_arr = np.array(list(lat) + [p[0] for p in waterline_points])
-    lon_arr = np.array(list(lon) + [p[1] for p in waterline_points])
-    depth_arr = np.array(list(depth) + [0.0] * len(waterline_points))
+    waterline_lines = waterline_lines or []
+    channel_lines = channel_lines or []
+    channel_points = [p for line in channel_lines for p in line]
+    lat_list, lon_list, depth_list = list(lat), list(lon), list(depth)
 
-    crs, fwd, inv = make_proj(float(np.median(lon_arr)), float(np.median(lat_arr)))
-    E, N = fwd.transform(lon_arr, lat_arr)
+    crs, fwd, inv = make_proj(float(np.median(lon_list)), float(np.median(lat_list)))
+    track_E, track_N = fwd.transform(lon_list, lat_list)
+
+    channel_depth = []
+    ch_E = ch_N = np.array([])
+    if channel_points:
+        tree = cKDTree(np.column_stack([track_E, track_N]))
+        ch_E, ch_N = fwd.transform([p[1] for p in channel_points], [p[0] for p in channel_points])
+        _, idx = tree.query(np.column_stack([ch_E, ch_N]))
+        channel_depth = [float(depth_list[i]) for i in idx]
+
+    # Глубина 0 должна держаться по всей линии уреза, а не только в точках
+    # клика мышью — иначе между редкими кликами линейная интерполяция тянет
+    # значение от ближайшего реального промера, и глубина у самой кромки воды
+    # не подходит к нулю. Уплотняем каждую линию уреза с шагом в половину
+    # ячейки сетки перед тем, как отдать её в griddata как точки глубины 0.
+    wl_dense_E, wl_dense_N = [], []
+    for line in waterline_lines:
+        if len(line) < 2:
+            if line:
+                e0, n0 = fwd.transform([line[0][1]], [line[0][0]])
+                wl_dense_E.append(float(e0[0]))
+                wl_dense_N.append(float(n0[0]))
+            continue
+        le, ln = fwd.transform([p[1] for p in line], [p[0] for p in line])
+        de, dn = _densify_polyline(le, ln, cell * 0.5)
+        wl_dense_E.extend(de.tolist())
+        wl_dense_N.extend(dn.tolist())
+
+    E = np.concatenate([track_E, np.array(wl_dense_E), ch_E])
+    N = np.concatenate([track_N, np.array(wl_dense_N), ch_N])
+    depth_arr = np.array(depth_list + [0.0] * len(wl_dense_E) + channel_depth)
 
     x0, y0 = float(E.min()), float(N.min())
     nx = max(2, int((E.max() - x0) / cell) + 1)
@@ -1259,28 +1359,91 @@ def compute_isobaths(lat, lon, depth, waterline_points, cell, interval, fill_ste
     Z = griddata((E, N), depth_arr, (GX, GY), method="linear")
     if np.all(np.isnan(Z)):
         raise ValueError("Не удалось построить сетку — проверьте данные")
-    if smooth and smooth > 0:
-        nan_mask = np.isnan(Z)
+    # method="linear" не считает ничего за выпуклой оболочкой точек — без
+    # уреза эти ячейки честно остаются пустыми (nan_mask ниже), но если урез
+    # нарисован, он сам определяет, где должна быть вода (см. water_mask
+    # ниже), и тогда такие ячейки внутри уреза дозаполняются ближайшим
+    # соседом — иначе изобаты не доходят до линии уреза в заливах/бухтах,
+    # куда лодка не подходила вплотную к берегу. Дозаполняем всегда (не
+    # только внутри будущей маски), чтобы gaussian_filter ниже не размывал
+    # NaN на соседние валидные ячейки.
+    nan_mask = np.isnan(Z)
+    if nan_mask.any():
         Zfill = griddata((E, N), depth_arr, (GX, GY), method="nearest")
-        Zs = np.where(nan_mask, Zfill, Z)
-        Zs = gaussian_filter(Zs, sigma=float(smooth))
-        Z = np.where(nan_mask, np.nan, Zs)
+        Z = np.where(nan_mask, Zfill, Z)
+    if smooth and smooth > 0:
+        Z = gaussian_filter(Z, sigma=float(smooth))
 
-    if len(waterline_points) >= 3:
-        # Изобаты не должны заходить на сушу за нарисованный урез воды: замыкаем
-        # нарисованную линию в многоугольник (от последней точки к первой) и
-        # определяем, какая сторона — вода, по тому, где лежит сам трек (лодка
-        # не плавает по суше); ячейки сетки на другой стороне маскируем — тогда
-        # contour/contourf там ничего не рисуют, без ручного отреза геометрии.
-        wl_E, wl_N = fwd.transform([p[1] for p in waterline_points],
-                                    [p[0] for p in waterline_points])
+    # Изобаты не должны заходить на сушу за нарисованный урез воды: каждую
+    # линию уреза с >=3 точками замыкаем в многоугольник и определяем, какая
+    # сторона — вода, по тому, где лежит сам трек (лодка не плавает по суше);
+    # ячейки сетки на другой стороне маскируем — тогда contour/contourf там
+    # ничего не рисуют, без ручного отреза геометрии. Несколько линий уреза
+    # (например, оба берега узкого залива) сужают область воды последовательно
+    # (пересечение масок).
+    #
+    # Урез почти всегда рисуют как ОТКРЫТУЮ линию вдоль берега (не замкнутый
+    # контур острова/озера целиком) — a Path.contains_points всё равно неявно
+    # замыкает контур прямым отрезком от последней точки к первой. Если этот
+    # отрезок просто прямая через всю акваторию, он отрезает область воды по
+    # диагонали безо всякой связи с нарисованной линией (видно на карте как
+    # залив, залитый лишь до случайной прямой). Поэтому открытую линию перед
+    # замыканием продлеваем по касательной на обоих концах далеко за пределы
+    # сетки — тогда неявное замыкающее ребро проходит вне видимой области, а
+    # маску формирует сама нарисованная линия (продолженная в сторону, куда
+    # она и так шла), а не срез напрямик. Уже замкнутый контур (последняя
+    # точка рядом с первой — остров, изолированная акватория) продлевать не
+    # нужно, используем как есть.
+    span = float(np.hypot(E.max() - E.min(), N.max() - N.min())) * 2.0
+    water_mask = None
+    for line in waterline_lines:
+        if len(line) < 3:
+            continue
+        wl_E, wl_N = fwd.transform([p[1] for p in line], [p[0] for p in line])
+        closed = np.hypot(wl_E[0] - wl_E[-1], wl_N[0] - wl_N[-1]) < max(cell * 3, span * 0.01)
+        if not closed and span > 0:
+            d0 = np.hypot(wl_E[0] - wl_E[1], wl_N[0] - wl_N[1]) or 1.0
+            p_start = (wl_E[0] + (wl_E[0] - wl_E[1]) / d0 * span,
+                       wl_N[0] + (wl_N[0] - wl_N[1]) / d0 * span)
+            d1 = np.hypot(wl_E[-1] - wl_E[-2], wl_N[-1] - wl_N[-2]) or 1.0
+            p_end = (wl_E[-1] + (wl_E[-1] - wl_E[-2]) / d1 * span,
+                     wl_N[-1] + (wl_N[-1] - wl_N[-2]) / d1 * span)
+            wl_E = np.concatenate([[p_start[0]], wl_E, [p_end[0]]])
+            wl_N = np.concatenate([[p_start[1]], wl_N, [p_end[1]]])
         wl_path = MplPath(np.column_stack([wl_E, wl_N]))
         track_pts = np.column_stack([E[:len(lat)], N[:len(lat)]])
         track_inside = wl_path.contains_points(track_pts).mean() >= 0.5
         grid_inside = wl_path.contains_points(
             np.column_stack([GX.ravel(), GY.ravel()])).reshape(GX.shape)
-        water_mask = grid_inside if track_inside else ~grid_inside
+        line_mask = grid_inside if track_inside else ~grid_inside
+        water_mask = line_mask if water_mask is None else (water_mask & line_mask)
+
+    if water_mask is not None and channel_lines:
+        # Русло — тоже точно вода, даже если нарисованный урез (например,
+        # только у одного берега) формально не накрывает эту область: полоса
+        # в пару ячеек сетки вокруг каждой линии русла принудительно
+        # включается в воду, иначе изобаты обрываются, не доходя до русла.
+        dense_E, dense_N = [], []
+        for line in channel_lines:
+            if len(line) < 2:
+                continue
+            le, ln = fwd.transform([p[1] for p in line], [p[0] for p in line])
+            de, dn = _densify_polyline(le, ln, cell * 0.5)
+            dense_E.extend(de.tolist())
+            dense_N.extend(dn.tolist())
+        if dense_E:
+            tree = cKDTree(np.column_stack([dense_E, dense_N]))
+            dist, _ = tree.query(np.column_stack([GX.ravel(), GY.ravel()]))
+            channel_forced = dist.reshape(GX.shape) < cell * 2.0
+            water_mask = water_mask | channel_forced
+
+    if water_mask is not None:
+        # Урез нарисован — он единственная граница, есть данные или нет.
         Z = np.where(water_mask, Z, np.nan)
+    else:
+        # Уреза нет — не выдумываем данные за пределами того, что реально
+        # накрывает линейная интерполяция (прежнее поведение).
+        Z = np.where(nan_mask, np.nan, Z)
 
     Zm = np.ma.masked_invalid(Z)
     zmin, zmax = float(np.nanmin(Z)), float(np.nanmax(Z))
@@ -1317,7 +1480,8 @@ def compute_isobaths(lat, lon, depth, waterline_points, cell, interval, fill_ste
                 hi_level = float(fill_levels[i + 1]) if i + 1 < len(fill_levels) else zmax
                 bands.append(dict(lo=lo_level, hi=hi_level, rings=rings))
     plt.close(fig)
-    return dict(lines=lines, bands=bands, zmin=zmin, zmax=zmax)
+    terrain = _build_terrain_mesh(GX, GY, Z)
+    return dict(lines=lines, bands=bands, zmin=zmin, zmax=zmax, terrain=terrain)
 
 
 def read_waterline_points(path):
@@ -1359,10 +1523,81 @@ def read_waterline_points(path):
     return points
 
 
-def build_isobaths_map_html(basemap, lat, lon):
+def read_waterline_kml(path):
+    """Читает линии уреза/русла из KML (LineString/MultiGeometry). Тип линии
+    определяет цвет стиля (свой у Placemark либо через styleUrl на <Style
+    id=...> уровня документа) — KML хранит цвет как aabbggrr (не rgb):
+    красный/оранжевый канал (r>b) — урез, синий/голубой (b>r) — русло. Линии
+    без определённого цвета (нет стиля вовсе) считаются урезом — для
+    совместимости с простыми KML без оформления. Каждый блок <coordinates>
+    (Placemark может содержать несколько — например, в MultiGeometry) — своя
+    отдельная линия. Возвращает (urez_lines, channel_lines) — списки линий,
+    линия — список точек (lat, lon)."""
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError as e:
+        raise ValueError(f"Некорректный KML: {e}")
+
+    m = re.match(r"\{(.+)\}", root.tag)
+    uri = m.group(1) if m else None
+
+    def tag(name):
+        return f"{{{uri}}}{name}" if uri else name
+
+    style_colors = {}
+    for style in root.iter(tag("Style")):
+        sid = style.get("id")
+        color_el = style.find(f"{tag('LineStyle')}/{tag('color')}")
+        if sid and color_el is not None and color_el.text:
+            style_colors[sid] = color_el.text.strip()
+
+    urez_lines, channel_lines = [], []
+    for placemark in root.iter(tag("Placemark")):
+        color_hex = None
+        inline_color = placemark.find(f"{tag('Style')}/{tag('LineStyle')}/{tag('color')}")
+        if inline_color is not None and inline_color.text:
+            color_hex = inline_color.text.strip()
+        else:
+            style_url = placemark.find(tag("styleUrl"))
+            if style_url is not None and style_url.text:
+                color_hex = style_colors.get(style_url.text.strip().lstrip("#"))
+
+        kind = "urez"
+        if color_hex and len(color_hex) == 8:
+            try:
+                r, b = int(color_hex[6:8], 16), int(color_hex[2:4], 16)
+                if b > r:
+                    kind = "channel"
+            except ValueError:
+                pass
+
+        for coord_el in placemark.iter(tag("coordinates")):
+            if not coord_el.text:
+                continue
+            line = []
+            for tuple_str in coord_el.text.split():
+                parts = tuple_str.split(",")
+                if len(parts) < 2:
+                    continue
+                try:
+                    lon, lat = float(parts[0]), float(parts[1])
+                except ValueError:
+                    continue
+                line.append((lat, lon))
+            if line:
+                (urez_lines if kind == "urez" else channel_lines).append(line)
+
+    if not urez_lines and not channel_lines:
+        raise ValueError("Не удалось прочитать линии из KML-файла")
+    return urez_lines, channel_lines
+
+
+def build_isobaths_map_html(basemap, lat, lon, excluded_indices=None):
     tile = BASEMAPS[basemap]
     center = [sum(lat) / len(lat), sum(lon) / len(lon)] if lat else [0, 0]
     pts = list(zip(lat, lon))
+    excluded_json = json.dumps(sorted(excluded_indices) if excluded_indices else [])
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
@@ -1391,9 +1626,13 @@ def build_isobaths_map_html(basemap, lat, lon):
 var map = L.map('map', {{preferCanvas: true, attributionControl: false}}).setView([{center[0]}, {center[1]}], 15);
 L.tileLayer('{tile["url"]}', {{maxZoom: {tile["max_zoom"]}}}).addTo(map);
 var pts = {json.dumps(pts)};
+var excludedIdx = new Set({excluded_json});
 var ptsLayer = L.featureGroup();
-pts.forEach(function (p) {{
-  L.circleMarker([p[0], p[1]], {{radius: 2, weight: 0, fillColor: '#ff0000', fillOpacity: 0.7}}).addTo(ptsLayer);
+var ptsMarkers = pts.map(function (p, i) {{
+  var m = L.circleMarker([p[0], p[1]], {{radius: 2, weight: 0, fillColor: '#ff0000',
+                                         fillOpacity: 0.7, interactive: false}});
+  if (!excludedIdx.has(i)) {{ m.addTo(ptsLayer); }}
+  return m;
 }});
 ptsLayer.addTo(map);
 if (pts.length) {{ map.fitBounds(ptsLayer.getBounds()); }}
@@ -1403,35 +1642,260 @@ function setTrackVisible(v) {{
   else {{ if (map.hasLayer(ptsLayer)) {{ map.removeLayer(ptsLayer); }} }}
 }}
 
-var drawMode = false;
-var waterline = [];
-var waterlineLine = L.polyline([], {{color: '#ffa500', weight: 3}}).addTo(map);
-var waterlineMarkers = L.layerGroup().addTo(map);
-
-function setDrawMode(v) {{ drawMode = v; }}
-function clearWaterline() {{
-  waterline = [];
-  waterlineLine.setLatLngs([]);
-  waterlineMarkers.clearLayers();
+// Очистка точек: режим «Удалить точки» — клик по ближайшей точке трека
+// переключает её исключение из расчёта изобат (клик ещё раз — вернуть).
+var cleanMode = false;
+function setCleanMode(v) {{ cleanMode = v; updateCursor(); }}
+function nearestPointIdx(latlng) {{
+  var bestI = -1, bestD = 12;
+  for (var i = 0; i < pts.length; i++) {{
+    var d = distPx(latlng, L.latLng(pts[i][0], pts[i][1]));
+    if (d < bestD) {{ bestD = d; bestI = i; }}
+  }}
+  return bestI;
 }}
-function setWaterline(points) {{
-  waterline = points.slice();
-  waterlineLine.setLatLngs(waterline);
-  waterlineMarkers.clearLayers();
-  waterline.forEach(function (p) {{
-    L.circleMarker(p, {{radius: 3, color: '#ffa500', fillColor: '#ffa500', fillOpacity: 1}}).addTo(waterlineMarkers);
+function restoreAllPoints() {{
+  excludedIdx.forEach(function (i) {{ ptsMarkers[i].addTo(ptsLayer); }});
+  excludedIdx.clear();
+}}
+map.on('click', function (e) {{
+  if (!cleanMode) {{ return; }}
+  var i = nearestPointIdx(e.latlng);
+  if (i < 0) {{ return; }}
+  if (excludedIdx.has(i)) {{ excludedIdx.delete(i); ptsMarkers[i].addTo(ptsLayer); }}
+  else {{ excludedIdx.add(i); ptsLayer.removeLayer(ptsMarkers[i]); }}
+  if (bridge) {{ bridge.pointToggled(i); }}
+}});
+
+// Редактор линий уреза/русла: несколько линий каждого типа, правая кнопка
+// мыши завершает текущую линию (или удаляет линию под курсором, если сейчас
+// ничего не рисуется), Ctrl+клик вставляет точку в ближайшую линию, Shift+
+// клик удаляет ближайшую точку, концы линий (своей и чужого типа) притягивают
+// друг друга при постановке новой точки.
+var SNAP_PX = 15, HIT_PX = 10;
+var drawMode = false, drawChannelMode = false;
+var waterlineLines = [], channelLines = [];
+var currentLine = [], currentLineType = null;
+
+var waterlineLinesLayer = L.layerGroup();
+var waterlineMarkersLayer = L.layerGroup();
+var channelLinesLayer = L.layerGroup();
+var channelMarkersLayer = L.layerGroup();
+var waterlineGroup = L.layerGroup(
+  [waterlineLinesLayer, waterlineMarkersLayer, channelLinesLayer, channelMarkersLayer]).addTo(map);
+
+var smoothPreview = false;
+function chaikinSmooth(points, iterations) {{
+  var pts = points.slice();
+  if (pts.length < 3) {{ return pts; }}
+  for (var it = 0; it < iterations; it++) {{
+    var smoothed = [pts[0]];
+    for (var i = 0; i < pts.length - 1; i++) {{
+      var p0 = pts[i], p1 = pts[i + 1];
+      smoothed.push([0.75 * p0[0] + 0.25 * p1[0], 0.75 * p0[1] + 0.25 * p1[1]],
+                     [0.25 * p0[0] + 0.75 * p1[0], 0.25 * p0[1] + 0.75 * p1[1]]);
+    }}
+    smoothed.push(pts[pts.length - 1]);
+    pts = smoothed;
+  }}
+  return pts;
+}}
+function setSmoothPreview(v) {{ smoothPreview = v; redrawAll(); }}
+
+function drawLineSet(lines, current, color, linesLayer, markersLayer) {{
+  linesLayer.clearLayers();
+  markersLayer.clearLayers();
+  lines.forEach(function (line) {{
+    // Линия на экране — сглаженная (если включено), но вершины-маркеры всегда
+    // по исходным точкам: так видно и куда реально кликал пользователь (для
+    // Ctrl/Shift-редактирования), и как линия ляжет в расчёте.
+    var renderLine = smoothPreview ? chaikinSmooth(line, 2) : line;
+    if (renderLine.length > 1) {{
+      L.polyline(renderLine, {{color: color, weight: 3, interactive: false}}).addTo(linesLayer);
+    }}
+    line.forEach(function (p) {{
+      L.circleMarker(p, {{radius: 3, color: color, fillColor: color, fillOpacity: 1,
+                          interactive: false}}).addTo(markersLayer);
+    }});
   }});
+  if (current && current.length) {{
+    var renderCurrent = smoothPreview ? chaikinSmooth(current, 2) : current;
+    if (renderCurrent.length > 1) {{
+      L.polyline(renderCurrent, {{color: color, weight: 3, interactive: false}}).addTo(linesLayer);
+    }}
+    current.forEach(function (p) {{
+      L.circleMarker(p, {{radius: 3, color: color, fillColor: '#ffffff', fillOpacity: 1,
+                          interactive: false}}).addTo(markersLayer);
+    }});
+  }}
+}}
+function redrawAll() {{
+  drawLineSet(waterlineLines, currentLineType === 'waterline' ? currentLine : null,
+              '#ffa500', waterlineLinesLayer, waterlineMarkersLayer);
+  drawLineSet(channelLines, currentLineType === 'channel' ? currentLine : null,
+              '#00bfff', channelLinesLayer, channelMarkersLayer);
 }}
 
 var bridge = null;
 new QWebChannel(qt.webChannelTransport, function (channel) {{ bridge = channel.objects.bridge; }});
 
+function sendState() {{
+  if (!bridge) {{ return; }}
+  var wl = waterlineLines.slice(), ch = channelLines.slice();
+  if (currentLine.length) {{
+    if (currentLineType === 'waterline') {{ wl = wl.concat([currentLine]); }}
+    else if (currentLineType === 'channel') {{ ch = ch.concat([currentLine]); }}
+  }}
+  bridge.linesChanged(JSON.stringify({{waterline: wl, channel: ch}}));
+}}
+
+function updateCursor() {{
+  map.getContainer().style.cursor = (drawMode || drawChannelMode || cleanMode) ? 'crosshair' : '';
+}}
+
+function finishCurrentLine() {{
+  if (currentLine.length > 0) {{
+    if (currentLineType === 'waterline') {{ waterlineLines.push(currentLine); }}
+    else if (currentLineType === 'channel') {{ channelLines.push(currentLine); }}
+  }}
+  currentLine = [];
+  redrawAll();
+  sendState();
+}}
+
+function setDrawMode(v) {{
+  if (v) {{
+    if (currentLine.length && currentLineType !== 'waterline') {{ finishCurrentLine(); }}
+    drawMode = true; currentLineType = 'waterline';
+  }} else {{
+    drawMode = false;
+    if (currentLineType === 'waterline') {{ finishCurrentLine(); }}
+  }}
+  updateCursor();
+}}
+function setDrawChannelMode(v) {{
+  if (v) {{
+    if (currentLine.length && currentLineType !== 'channel') {{ finishCurrentLine(); }}
+    drawChannelMode = true; currentLineType = 'channel';
+  }} else {{
+    drawChannelMode = false;
+    if (currentLineType === 'channel') {{ finishCurrentLine(); }}
+  }}
+  updateCursor();
+}}
+function addLines(payload) {{
+  (payload.waterline || []).forEach(function (line) {{ if (line.length) {{ waterlineLines.push(line); }} }});
+  (payload.channel || []).forEach(function (line) {{ if (line.length) {{ channelLines.push(line); }} }});
+  redrawAll();
+}}
+function setWaterlineVisible(v) {{ setLayerVisible(waterlineGroup, v); }}
+
+function distPx(a, b) {{ return map.latLngToContainerPoint(a).distanceTo(map.latLngToContainerPoint(b)); }}
+function segDistPx(p, a, b) {{
+  var pp = map.latLngToContainerPoint(p), pa = map.latLngToContainerPoint(a), pb = map.latLngToContainerPoint(b);
+  var dx = pb.x - pa.x, dy = pb.y - pa.y, len2 = dx * dx + dy * dy;
+  var t = len2 ? Math.max(0, Math.min(1, ((pp.x - pa.x) * dx + (pp.y - pa.y) * dy) / len2)) : 0;
+  var ddx = pp.x - (pa.x + t * dx), ddy = pp.y - (pa.y + t * dy);
+  return Math.sqrt(ddx * ddx + ddy * ddy);
+}}
+function snapToEndpoint(latlng) {{
+  var best = null, bestD = SNAP_PX;
+  function check(p) {{
+    var d = distPx(latlng, L.latLng(p[0], p[1]));
+    if (d < bestD) {{ bestD = d; best = p; }}
+  }}
+  waterlineLines.forEach(function (l) {{ if (l.length) {{ check(l[0]); if (l.length > 1) {{ check(l[l.length - 1]); }} }} }});
+  channelLines.forEach(function (l) {{ if (l.length) {{ check(l[0]); if (l.length > 1) {{ check(l[l.length - 1]); }} }} }});
+  return best ? L.latLng(best[0], best[1]) : latlng;
+}}
+function findLineNear(latlng) {{
+  var best = null, bestD = HIT_PX;
+  function scan(lines, type) {{
+    lines.forEach(function (line, idx) {{
+      for (var i = 0; i < line.length - 1; i++) {{
+        var d = segDistPx(latlng, L.latLng(line[i][0], line[i][1]), L.latLng(line[i + 1][0], line[i + 1][1]));
+        if (d < bestD) {{ bestD = d; best = {{type: type, index: idx}}; }}
+      }}
+      if (line.length === 1 && distPx(latlng, L.latLng(line[0][0], line[0][1])) < bestD) {{
+        bestD = distPx(latlng, L.latLng(line[0][0], line[0][1])); best = {{type: type, index: idx}};
+      }}
+    }});
+  }}
+  scan(waterlineLines, 'waterline');
+  scan(channelLines, 'channel');
+  return best;
+}}
+function deleteLine(hit) {{
+  var arr = hit.type === 'waterline' ? waterlineLines : channelLines;
+  arr.splice(hit.index, 1);
+  redrawAll();
+  sendState();
+}}
+function insertPointIntoNearestLine(latlng) {{
+  var best = null, bestD = HIT_PX;
+  function scan(lines, type) {{
+    lines.forEach(function (line, li) {{
+      for (var i = 0; i < line.length - 1; i++) {{
+        var d = segDistPx(latlng, L.latLng(line[i][0], line[i][1]), L.latLng(line[i + 1][0], line[i + 1][1]));
+        if (d < bestD) {{ bestD = d; best = {{type: type, li: li, seg: i, current: false}}; }}
+      }}
+    }});
+  }}
+  scan(waterlineLines, 'waterline');
+  scan(channelLines, 'channel');
+  for (var i = 0; i < currentLine.length - 1; i++) {{
+    var d = segDistPx(latlng, L.latLng(currentLine[i][0], currentLine[i][1]), L.latLng(currentLine[i + 1][0], currentLine[i + 1][1]));
+    if (d < bestD) {{ bestD = d; best = {{current: true, seg: i}}; }}
+  }}
+  if (!best) {{ return; }}
+  var newPt = [latlng.lat, latlng.lng];
+  if (best.current) {{ currentLine.splice(best.seg + 1, 0, newPt); }}
+  else {{ (best.type === 'waterline' ? waterlineLines : channelLines)[best.li].splice(best.seg + 1, 0, newPt); }}
+  redrawAll();
+  sendState();
+}}
+function deleteNearestPoint(latlng) {{
+  var best = null, bestD = HIT_PX;
+  function scan(lines, type) {{
+    lines.forEach(function (line, li) {{
+      line.forEach(function (p, pi) {{
+        var d = distPx(latlng, L.latLng(p[0], p[1]));
+        if (d < bestD) {{ bestD = d; best = {{type: type, li: li, pi: pi, current: false}}; }}
+      }});
+    }});
+  }}
+  scan(waterlineLines, 'waterline');
+  scan(channelLines, 'channel');
+  currentLine.forEach(function (p, pi) {{
+    var d = distPx(latlng, L.latLng(p[0], p[1]));
+    if (d < bestD) {{ bestD = d; best = {{current: true, pi: pi}}; }}
+  }});
+  if (!best) {{ return; }}
+  if (best.current) {{ currentLine.splice(best.pi, 1); }}
+  else {{
+    var arr = best.type === 'waterline' ? waterlineLines : channelLines;
+    arr[best.li].splice(best.pi, 1);
+    if (arr[best.li].length === 0) {{ arr.splice(best.li, 1); }}
+  }}
+  redrawAll();
+  sendState();
+}}
+
 map.on('click', function (e) {{
-  if (!drawMode) {{ return; }}
-  waterline.push([e.latlng.lat, e.latlng.lng]);
-  waterlineLine.setLatLngs(waterline);
-  L.circleMarker(e.latlng, {{radius: 3, color: '#ffa500', fillColor: '#ffa500', fillOpacity: 1}}).addTo(waterlineMarkers);
-  if (bridge) {{ bridge.mapClicked(e.latlng.lat, e.latlng.lng); }}
+  var oe = e.originalEvent;
+  if (oe && oe.ctrlKey) {{ insertPointIntoNearestLine(e.latlng); return; }}
+  if (oe && oe.shiftKey) {{ deleteNearestPoint(e.latlng); return; }}
+  if (!drawMode && !drawChannelMode) {{ return; }}
+  var snapped = snapToEndpoint(e.latlng);
+  currentLine.push([snapped.lat, snapped.lng]);
+  redrawAll();
+  sendState();
+}});
+
+map.on('contextmenu', function (e) {{
+  if (currentLine.length > 0) {{ finishCurrentLine(); return; }}
+  var hit = findLineNear(e.latlng);
+  if (hit) {{ deleteLine(hit); }}
 }});
 
 var fillLayer = L.layerGroup().addTo(map);
@@ -1596,6 +2060,152 @@ def build_isobaths_js(result, style):
     return f"drawIsobaths({json.dumps(payload)});"
 
 
+def build_terrain_html(terrain):
+    """3D-вид дна (вкладка «Построение изобат» → «3D дно») — грид глубин
+    (уже уменьшенный до разумного размера в _build_terrain_mesh) как меш в
+    Three.js, загружаемом с CDN тем же способом, что и Leaflet в остальных
+    картах. Окраска — та же jet-палитра и то же направление (мельче —
+    красный, глубже — синий), что на 2D карте (build_map_html), но
+    посчитанная в JS заново — это отдельная HTML-страница, свой JS-контекст,
+    ничего нельзя переиспользовать между страницами напрямую. Ячейки без
+    данных (null) не попадают ни в один треугольник — дыра в поверхности,
+    как пустая область на 2D карте."""
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<script src="https://unpkg.com/three@0.128.0/build/three.min.js"></script>
+<script src="https://unpkg.com/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<style>html,body{{height:100%;margin:0;background:#1e1e1e;overflow:hidden}}
+#hint{{position:absolute;left:8px;bottom:6px;color:#aaa;font:12px sans-serif;
+      pointer-events:none}}
+#empty{{position:absolute;left:0;right:0;top:45%;text-align:center;color:#999;
+       font:14px sans-serif;display:none}}</style>
+</head><body>
+<div id="hint">ЛКМ — вращение, колесо — зум, ПКМ — сдвиг</div>
+<div id="empty">Нет данных для 3D-вида — постройте изобаты хотя бы с одной точкой глубины.</div>
+<script>
+var terrain = {json.dumps(terrain)};
+var nx = terrain.nx, ny = terrain.ny;
+var cellX = terrain.cellX || 1, cellY = terrain.cellY || 1;
+var zmin = terrain.zmin, zmax = terrain.zmax;
+
+var jetStops = [
+  [0.0, [0, 0, 143]], [0.125, [0, 0, 255]], [0.375, [0, 255, 255]],
+  [0.625, [255, 255, 0]], [0.875, [255, 0, 0]], [1.0, [128, 0, 0]]
+];
+function jetColorRGB(t) {{
+  for (var i = 0; i < jetStops.length - 1; i++) {{
+    var a = jetStops[i], b = jetStops[i + 1];
+    if (t <= b[0] || i === jetStops.length - 2) {{
+      var f = (t - a[0]) / (b[0] - a[0]);
+      return [(a[1][0] + f * (b[1][0] - a[1][0])) / 255,
+              (a[1][1] + f * (b[1][1] - a[1][1])) / 255,
+              (a[1][2] + f * (b[1][2] - a[1][2])) / 255];
+    }}
+  }}
+}}
+function depthColorRGB(v) {{
+  var t = Math.max(0, Math.min(1, (v - zmin) / ((zmax - zmin) || 1)));
+  return jetColorRGB(1 - t);
+}}
+
+var scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1e1e1e);
+var camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1e6);
+var renderer = new THREE.WebGLRenderer({{antialias: true}});
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
+scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+var dirLight = new THREE.DirectionalLight(0xffffff, 0.6);
+dirLight.position.set(1, 1.5, 1);
+scene.add(dirLight);
+
+var controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+
+var mesh = null, geometry = null, rawZ = [], zExaggeration = 3.0;
+
+function buildMesh() {{
+  if (nx < 2 || ny < 2) {{ document.getElementById('empty').style.display = 'block'; return; }}
+  var centerX = (nx - 1) * cellX / 2, centerY = (ny - 1) * cellY / 2;
+  var positions = new Float32Array(nx * ny * 3);
+  var colors = new Float32Array(nx * ny * 3);
+  rawZ = new Array(nx * ny);
+  var any_valid = false;
+  var p = 0;
+  for (var j = 0; j < ny; j++) {{
+    for (var i = 0; i < nx; i++) {{
+      var v = terrain.z[j][i];
+      positions[p * 3 + 0] = i * cellX - centerX;
+      positions[p * 3 + 2] = j * cellY - centerY;
+      if (v === null) {{
+        positions[p * 3 + 1] = 0;
+        rawZ[p] = null;
+        colors[p * 3 + 0] = 0.25; colors[p * 3 + 1] = 0.25; colors[p * 3 + 2] = 0.25;
+      }} else {{
+        any_valid = true;
+        positions[p * 3 + 1] = -v * zExaggeration;
+        rawZ[p] = v;
+        var c = depthColorRGB(v);
+        colors[p * 3 + 0] = c[0]; colors[p * 3 + 1] = c[1]; colors[p * 3 + 2] = c[2];
+      }}
+      p++;
+    }}
+  }}
+  if (!any_valid) {{ document.getElementById('empty').style.display = 'block'; return; }}
+  var indices = [];
+  for (var jj = 0; jj < ny - 1; jj++) {{
+    for (var ii = 0; ii < nx - 1; ii++) {{
+      if (terrain.z[jj][ii] === null || terrain.z[jj][ii + 1] === null ||
+          terrain.z[jj + 1][ii] === null || terrain.z[jj + 1][ii + 1] === null) {{ continue; }}
+      var a = jj * nx + ii, b = jj * nx + ii + 1, c2 = (jj + 1) * nx + ii, d = (jj + 1) * nx + ii + 1;
+      indices.push(a, c2, b);
+      indices.push(b, c2, d);
+    }}
+  }}
+  geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  geometry.setIndex(indices);
+  geometry.computeVertexNormals();
+  var material = new THREE.MeshLambertMaterial({{vertexColors: true, side: THREE.DoubleSide}});
+  mesh = new THREE.Mesh(geometry, material);
+  scene.add(mesh);
+
+  var span = Math.max(nx * cellX, ny * cellY, 1);
+  camera.position.set(span * 0.6, span * 0.5, span * 0.6);
+  controls.target.set(0, 0, 0);
+  controls.update();
+}}
+buildMesh();
+
+function setExaggeration(v) {{
+  zExaggeration = v;
+  if (!geometry) {{ return; }}
+  var pos = geometry.attributes.position;
+  for (var k = 0; k < rawZ.length; k++) {{
+    if (rawZ[k] !== null) {{ pos.setY(k, -rawZ[k] * zExaggeration); }}
+  }}
+  pos.needsUpdate = true;
+  geometry.computeVertexNormals();
+}}
+
+function animate() {{
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}}
+animate();
+
+window.addEventListener('resize', function () {{
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+}});
+</script>
+</body></html>"""
+
+
 def compute_time_offset(sl2_path, gnss_paths):
     if isinstance(gnss_paths, str):
         gnss_paths = [gnss_paths]
@@ -1718,19 +2328,32 @@ class DepthRulerWidget(QWidget):
 class EchoTimelineWidget(QWidget):
     """Профиль глубины дна (по данным сонара, depth_m — единственное здесь
     откалиброванное значение) под эхограммой. По горизонтали синхронизирован
-    со скроллом канваса, как линейка — по вертикали."""
-    HEIGHT = 60
+    со скроллом канваса, как линейка — по вертикали. Разметка оси (время/
+    расстояние) — как на таймлайне главной карты (build_map_html/drawTimeline):
+    вертикальные линии на всю высоту графика + подписи снизу."""
+    AXIS_H = 14
+    HEIGHT = 60 + AXIS_H
+    wheelZoom = Signal(float)  # множитель масштаба (>1 крупнее, <1 мельче) — см. apply_zoom_factor
 
     def __init__(self):
         super().__init__()
         self.setFixedHeight(self.HEIGHT)
         self.depth_m = []
+        self.axis_vals = []
+        self.axis_mode = "time"
         self.content_width = 0
         self.scroll_x = 0
         self.hover_col = None
 
-    def set_params(self, depth_m, content_width):
+    def wheelEvent(self, event):
+        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        self.wheelZoom.emit(factor)
+        event.accept()
+
+    def set_params(self, depth_m, axis_vals, axis_mode, content_width):
         self.depth_m = depth_m
+        self.axis_vals = axis_vals
+        self.axis_mode = axis_mode
         self.content_width = content_width
         self.update()
 
@@ -1749,28 +2372,92 @@ class EchoTimelineWidget(QWidget):
         if n < 2 or self.content_width <= 0:
             return
         w, h = self.width(), self.height()
+        plot_h = h - self.AXIS_H
         dmin, dmax = min(self.depth_m), max(self.depth_m)
         if dmax <= dmin:
             dmax = dmin + 1e-6
         per_ping = self.content_width / n
         i0 = max(0, int(self.scroll_x / per_ping) - 1)
         i1 = min(n, int((self.scroll_x + w) / per_ping) + 2)
+
+        if len(self.axis_vals) >= 2:
+            a0, a1 = self.axis_vals[0], self.axis_vals[-1]
+            ticks = max(2, min(8, w // 90))
+            painter.setPen(QColor(255, 255, 255, 38))
+            for k in range(ticks + 1):
+                x = k / ticks * w
+                painter.drawLine(int(x), 0, int(x), plot_h)
+            font = painter.font()
+            font.setPointSize(8)
+            painter.setFont(font)
+            painter.setPen(QColor("#aaa"))
+            for k in range(ticks + 1):
+                frac = k / ticks
+                x = frac * w
+                label = format_axis_label(a0 + frac * (a1 - a0), self.axis_mode)
+                if k == 0:
+                    align = Qt.AlignmentFlag.AlignLeft
+                elif k == ticks:
+                    align = Qt.AlignmentFlag.AlignRight
+                else:
+                    align = Qt.AlignmentFlag.AlignHCenter
+                text_rect = QRect(int(x) - 40, plot_h, 80, self.AXIS_H)
+                painter.drawText(text_rect, int(align | Qt.AlignmentFlag.AlignVCenter), label)
+
         painter.setPen(QColor("#3388ff"))
         prev = None
         for i in range(i0, i1):
             x = i * per_ping - self.scroll_x
             t = (self.depth_m[i] - dmin) / (dmax - dmin)
-            y = 4 + t * (h - 8)
+            y = 4 + t * (plot_h - 8)
             if prev is not None:
                 painter.drawLine(int(prev[0]), int(prev[1]), int(x), int(y))
             prev = (x, y)
         if self.hover_col is not None and 0 <= self.hover_col < n:
             x = self.hover_col * per_ping - self.scroll_x
             painter.setPen(QColor(255, 255, 0, 200))
-            painter.drawLine(int(x), 0, int(x), h)
+            painter.drawLine(int(x), 0, int(x), plot_h)
             painter.setPen(QColor("white"))
             painter.drawText(min(w - 60, max(2, int(x) + 4)), 13,
                               f"{self.depth_m[self.hover_col]:.2f} м")
+
+
+def build_echo_minimap_html(basemap, lat, lon):
+    """Мини-карта в панели заметок вкладки «Эхограмма» — трек текущего файла
+    и жёлтый маркер положения под курсором на эхограмме (setCursor/hideCursor,
+    дёргается из Python при каждом hover_changed у EchogramCanvas)."""
+    tile = BASEMAPS[basemap]
+    center = [sum(lat) / len(lat), sum(lon) / len(lon)] if lat else [0, 0]
+    pts = list(zip(lat, lon))
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>html,body,#map{{height:100%;margin:0}}</style>
+</head><body>
+<div id="map"></div>
+<script>
+var map = L.map('map', {{preferCanvas: true, attributionControl: false, zoomControl: false}})
+  .setView([{center[0]}, {center[1]}], 14);
+L.tileLayer('{tile["url"]}', {{maxZoom: {tile["max_zoom"]}}}).addTo(map);
+var pts = {json.dumps(pts)};
+if (pts.length > 1) {{
+  var line = L.polyline(pts, {{color: '#ff3030', weight: 2}}).addTo(map);
+  map.fitBounds(line.getBounds());
+}} else if (pts.length === 1) {{
+  map.setView(pts[0], 16);
+}}
+var cursor = L.circleMarker([0, 0], {{radius: 6, color: '#fff', weight: 2,
+                                      fillColor: '#ffd400', fillOpacity: 1}});
+function setCursor(lat, lon) {{
+  cursor.setLatLng([lat, lon]);
+  if (!cursor._map) {{ cursor.addTo(map); }}
+}}
+function hideCursor() {{
+  if (cursor._map) {{ map.removeLayer(cursor); }}
+}}
+</script>
+</body></html>"""
 
 
 class EchogramCanvas(QWidget):
@@ -1998,16 +2685,22 @@ class EchogramCanvas(QWidget):
             painter.drawLine(int(x), h, int(x), h + 4)
             painter.drawText(int(x) - 15, h + self.AXIS_H - 4, label)
 
-    def wheelEvent(self, event):
+    def apply_zoom_factor(self, factor):
+        """Меняет масштаб на factor (>1 — крупнее, <1 — мельче) — общий код для
+        колеса мыши над самой эхограммой и над таймлайном под ней (см.
+        EchoTimelineWidget.wheelZoom)."""
         if self.image is None:
             return
-        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
         self.zoom = max(0.1, min(20.0, self.zoom * factor))
         self._rebuild_image()
         self.updateGeometry()
         self.resize(self.sizeHint())
         self.update()
         self.zoom_changed.emit()
+
+    def wheelEvent(self, event):
+        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        self.apply_zoom_factor(factor)
         event.accept()
 
 
@@ -2022,6 +2715,8 @@ class EchogramTab(QWidget):
         super().__init__()
         self.main_window = main_window
         self._loaded_path = None
+        self.echo_lat = []
+        self.echo_lon = []
 
         self.status_label = QLabel(
             "Выберите один файл эхограммы (.sl2) в шапке окна, чтобы посмотреть "
@@ -2036,10 +2731,10 @@ class EchogramTab(QWidget):
         self.scroll.setWidgetResizable(False)
         self.scroll.verticalScrollBar().valueChanged.connect(self.ruler_widget.set_scroll_offset)
 
-        self.mark_mode_btn = QPushButton("Режим меток")
+        self.mark_mode_btn = QPushButton("Режим заметок")
         self.mark_mode_btn.setCheckable(True)
         self.mark_mode_btn.setToolTip(
-            "Включите и кликните по эхограмме, чтобы поставить метку с текстом "
+            "Включите и кликните по эхограмме, чтобы поставить заметку с текстом "
             "в этом месте.")
         self.mark_mode_btn.toggled.connect(self.on_mark_mode_toggled)
         self.ruler_mode_btn = QPushButton("Линейка")
@@ -2050,9 +2745,9 @@ class EchogramTab(QWidget):
         self.ruler_mode_btn.toggled.connect(self.on_ruler_mode_toggled)
         clear_ruler_btn = QPushButton("Сбросить линейку")
         clear_ruler_btn.clicked.connect(self.clear_ruler)
-        save_marks_btn = QPushButton("Сохранить пометки")
+        save_marks_btn = QPushButton("Сохранить заметки")
         save_marks_btn.clicked.connect(self.save_marks)
-        load_marks_btn = QPushButton("Загрузить пометки")
+        load_marks_btn = QPushButton("Загрузить заметки")
         load_marks_btn.clicked.connect(self.load_marks)
 
         toolbar_row = QHBoxLayout()
@@ -2068,16 +2763,22 @@ class EchogramTab(QWidget):
         self.marks_list = QListWidget()
         self.marks_list.currentRowChanged.connect(self.on_mark_selected)
         self.mark_text_edit = QTextEdit()
-        self.mark_text_edit.setPlaceholderText("Текст пометки…")
         self.mark_text_edit.textChanged.connect(self.on_mark_text_changed)
-        remove_mark_btn = QPushButton("Удалить пометку")
+        remove_mark_btn = QPushButton("Удалить заметку")
         remove_mark_btn.clicked.connect(self.remove_selected_mark)
 
+        self.mini_map = new_map_view()
+        self.mini_map.setFixedHeight(200)
+        load_html(self.mini_map, build_echo_minimap_html(
+            self.main_window.basemap_combo.currentText(), [], []), "echo_minimap")
+
         marks_layout = QVBoxLayout()
-        marks_layout.addWidget(QLabel("Пометки:"))
+        marks_layout.addWidget(QLabel("Заметки:"))
         marks_layout.addWidget(self.marks_list, 1)
+        marks_layout.addWidget(QLabel("Текст заметки:"))
         marks_layout.addWidget(self.mark_text_edit, 1)
         marks_layout.addWidget(remove_mark_btn)
+        marks_layout.addWidget(self.mini_map)
         marks_widget = QWidget()
         marks_widget.setLayout(marks_layout)
         marks_widget.setFixedWidth(260)
@@ -2089,6 +2790,8 @@ class EchogramTab(QWidget):
 
         self.echo_timeline = EchoTimelineWidget()
         self.canvas.hover_changed.connect(self.echo_timeline.set_hover_col)
+        self.canvas.hover_changed.connect(self.on_hover_position)
+        self.echo_timeline.wheelZoom.connect(self.canvas.apply_zoom_factor)
         self.scroll.horizontalScrollBar().valueChanged.connect(self.echo_timeline.set_scroll_offset)
         timeline_row = QHBoxLayout()
         timeline_row.addSpacing(DepthRulerWidget.WIDTH)
@@ -2138,7 +2841,8 @@ class EchogramTab(QWidget):
         content_height = int(rows * self.canvas.zoom)
         self.ruler_widget.set_params(rows, content_height, self.canvas.range_m)
         content_width = int(cols * self.canvas.zoom)
-        self.echo_timeline.set_params(self.canvas.depth_m, content_width)
+        self.echo_timeline.set_params(self.canvas.depth_m, self.canvas.axis_vals,
+                                       self.canvas.axis_mode, content_width)
 
     def on_loaded(self, data):
         arr, valid, cal_range = build_echogram_image(data["records"], data["range_m"])
@@ -2159,9 +2863,21 @@ class EchogramTab(QWidget):
         axis_vals = data["dist"] if axis_mode == "distance" else data["t_rel"]
         self.canvas.set_data(arr, valid, data["depth_m"], axis_vals, axis_mode, cal_range)
         self.sync_side_widgets()
+        self.echo_lat = data.get("lat", [])
+        self.echo_lon = data.get("lon", [])
+        load_html(self.mini_map, build_echo_minimap_html(
+            self.main_window.basemap_combo.currentText(), self.echo_lat, self.echo_lon),
+            "echo_minimap")
 
     def on_error(self, message):
         self.status_label.setText(f"Ошибка чтения: {message}")
+
+    def on_hover_position(self, col):
+        if col is None or not self.echo_lat or col >= len(self.echo_lat):
+            self.mini_map.page().runJavaScript("hideCursor();")
+            return
+        self.mini_map.page().runJavaScript(
+            f"setCursor({self.echo_lat[col]}, {self.echo_lon[col]});")
 
     def on_mark_mode_toggled(self, checked):
         if checked:
@@ -2196,7 +2912,7 @@ class EchogramTab(QWidget):
         self.ruler_label.setText("Линейка: " + ", ".join(parts))
 
     def on_mark_requested(self, ping_idx, row):
-        text, ok = QInputDialog.getMultiLineText(self, "Пометка", "Текст пометки:")
+        text, ok = QInputDialog.getMultiLineText(self, "Заметка", "Текст заметки:")
         if not ok:
             return
         axis_value = None
@@ -2255,11 +2971,11 @@ class EchogramTab(QWidget):
 
     def save_marks(self):
         if not self.canvas.marks:
-            QMessageBox.information(self, "Пометки", "Нет пометок для сохранения.")
+            QMessageBox.information(self, "Заметки", "Нет заметок для сохранения.")
             return
         base = os.path.splitext(self._loaded_path)[0] if self._loaded_path else "echogram"
         path, _ = QFileDialog.getSaveFileName(
-            self, "Сохранить пометки", base + "_marks.json", "JSON (*.json)")
+            self, "Сохранить заметки", base + "_marks.json", "JSON (*.json)")
         if not path:
             return
         payload = dict(sl2_path=self._loaded_path, marks=self.canvas.marks)
@@ -2267,20 +2983,20 @@ class EchogramTab(QWidget):
             with open(path, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh, ensure_ascii=False, indent=2)
         except OSError as e:
-            QMessageBox.warning(self, "Пометки", f"Не удалось сохранить:\n{e}")
+            QMessageBox.warning(self, "Заметки", f"Не удалось сохранить:\n{e}")
             return
-        self.status_label.setText(f"Пометки сохранены: {path}")
+        self.status_label.setText(f"Заметки сохранены: {path}")
 
     def load_marks(self):
         start_dir = os.path.dirname(self._loaded_path) if self._loaded_path else ""
-        path, _ = QFileDialog.getOpenFileName(self, "Загрузить пометки", start_dir, "JSON (*.json)")
+        path, _ = QFileDialog.getOpenFileName(self, "Загрузить заметки", start_dir, "JSON (*.json)")
         if not path:
             return
         try:
             with open(path, encoding="utf-8") as fh:
                 payload = json.load(fh)
         except (OSError, ValueError) as e:
-            QMessageBox.warning(self, "Пометки", f"Не удалось прочитать файл:\n{e}")
+            QMessageBox.warning(self, "Заметки", f"Не удалось прочитать файл:\n{e}")
             return
         marks = payload.get("marks", [])
         if self.canvas.arr is not None:
@@ -2289,21 +3005,29 @@ class EchogramTab(QWidget):
         self.canvas.marks = marks
         self.canvas.update()
         self._refresh_marks_list()
-        self.status_label.setText(f"Загружено пометок: {len(marks)} из {path}")
+        self.status_label.setText(f"Загружено заметок: {len(marks)} из {path}")
 
 
-class MapClickBridge(QObject):
-    """Мост QWebChannel: клик по карте в JS вызывает mapClicked прямо в
-    Python (тот же поток, без QThread — сюда правило про сигналы между
-    потоками и QWebEngineView не относится)."""
+class IsobathsLinesBridge(QObject):
+    """Мост QWebChannel для карты на вкладке изобат — JS сам ведёт состояние
+    линий уреза/русла (добавление/вставка/удаление точек и целых линий,
+    прилипание концов, курсор) и очистки точек трека (клик — исключить/
+    вернуть) и после каждого изменения сообщает сюда; Python просто
+    запоминает для build_isobaths (тот же поток, без QThread — сюда правило
+    про сигналы между потоками и QWebEngineView не относится)."""
 
-    def __init__(self, on_click):
+    def __init__(self, on_change, on_point_toggled):
         super().__init__()
-        self.on_click = on_click
+        self.on_change = on_change
+        self.on_point_toggled = on_point_toggled
 
-    @Slot(float, float)
-    def mapClicked(self, lat, lon):
-        self.on_click(lat, lon)
+    @Slot(str)
+    def linesChanged(self, payload_json):
+        self.on_change(json.loads(payload_json))
+
+    @Slot(int)
+    def pointToggled(self, index):
+        self.on_point_toggled(index)
 
 
 class TrackCompareBridge(QObject):
@@ -2457,11 +3181,13 @@ class IsobathsTab(QWidget):
     def __init__(self, main_window):
         super().__init__()
         self.main_window = main_window
-        self.waterline_points = []
+        self.waterline_lines = []
+        self.channel_lines = []
         self.last_result = None
         self.line_color = QColor("#000000")
+        self.excluded_indices = set()
 
-        self.bridge = MapClickBridge(self.on_map_clicked)
+        self.bridge = IsobathsLinesBridge(self.on_lines_changed, self.on_point_toggled)
         self.channel = QWebChannel()
         self.channel.registerObject("bridge", self.bridge)
         self.map_view = new_map_view()
@@ -2504,20 +3230,63 @@ class IsobathsTab(QWidget):
         self.hide_track_btn.setCheckable(True)
         self.hide_track_btn.toggled.connect(self.on_hide_track_toggled)
 
-        load_waterline_btn = QPushButton("Загрузить урез из файла")
+        points_group = QGroupBox("Точки")
+        self.clean_btn = QPushButton("Удалить точки")
+        self.clean_btn.setCheckable(True)
+        self.clean_btn.setToolTip(
+            "Клик по точке трека на карте исключает её из расчёта изобат "
+            "(клик по ней ещё раз — вернуть). Для явных выбросов промера "
+            "(шум, всплытие датчика), которые портят интерполяцию.")
+        self.clean_btn.toggled.connect(self.on_clean_toggled)
+        self.points_label = QLabel("Исключено точек: 0")
+        restore_points_btn = QPushButton("Восстановить все")
+        restore_points_btn.clicked.connect(self.restore_all_points)
+        points_layout = QVBoxLayout()
+        points_layout.addWidget(self.clean_btn)
+        points_layout.addWidget(self.points_label)
+        points_layout.addWidget(restore_points_btn)
+        points_group.setLayout(points_layout)
+
+        waterline_group = QGroupBox("Урез")
+        load_waterline_btn = QPushButton("Загрузить урез")
         load_waterline_btn.clicked.connect(self.load_waterline_from_file)
         load_waterline_row = QHBoxLayout()
         load_waterline_row.addWidget(load_waterline_btn, 1)
         load_waterline_row.addWidget(help_icon(WATERLINE_FILE_HELP))
 
-        self.draw_btn = QPushButton("Нарисовать урез воды")
+        self.draw_btn = QPushButton("Нарисовать\nурез")
         self.draw_btn.setCheckable(True)
         self.draw_btn.toggled.connect(self.on_draw_toggled)
+        self.draw_channel_btn = QPushButton("Нарисовать\nрусло")
+        self.draw_channel_btn.setCheckable(True)
+        self.draw_channel_btn.toggled.connect(self.on_draw_channel_toggled)
+        draw_tip = ("Клик — точка (концы линий притягиваются друг к другу). ПКМ — "
+                     "закончить линию, а по уже нарисованной линии — удалить её. "
+                     "Ctrl+клик — вставить точку в ближайшую линию. Shift+клик — "
+                     "удалить ближайшую точку. Линий каждого типа может быть несколько.")
+        self.draw_btn.setToolTip(draw_tip)
+        self.draw_channel_btn.setToolTip(draw_tip)
+        draw_row = QHBoxLayout()
+        draw_row.addWidget(self.draw_btn)
+        draw_row.addWidget(self.draw_channel_btn)
 
-        clear_waterline_btn = QPushButton("Очистить урез")
-        clear_waterline_btn.clicked.connect(self.clear_waterline)
+        self.corner_smooth_check = QCheckBox("Сглаживание")
+        self.corner_smooth_check.setToolTip(
+            "Сглаживает острые углы нарисованных вручную линий уреза и русла "
+            "(начальная и конечная точки каждой линии остаются на месте) — "
+            "видно сразу на карте, действует и при нажатии «Построить».")
+        self.corner_smooth_check.toggled.connect(self.on_corner_smooth_toggled)
+        self.hide_waterline_check = QCheckBox("Скрыть")
+        self.hide_waterline_check.toggled.connect(self.on_hide_waterline_toggled)
+        options_row = QHBoxLayout()
+        options_row.addWidget(self.corner_smooth_check)
+        options_row.addWidget(self.hide_waterline_check)
 
-        self.waterline_label = QLabel("Точек уреза: 0")
+        waterline_layout = QVBoxLayout()
+        waterline_layout.addLayout(load_waterline_row)
+        waterline_layout.addLayout(draw_row)
+        waterline_layout.addLayout(options_row)
+        waterline_group.setLayout(waterline_layout)
 
         line_group = QGroupBox("Линии изобат")
         self.show_lines_check = QCheckBox("Отображать линии")
@@ -2555,12 +3324,12 @@ class IsobathsTab(QWidget):
         label_size_row = QHBoxLayout()
         label_size_row.addWidget(QLabel("Размер шрифта:"))
         label_size_row.addWidget(self.label_size_spin)
-        self.label_freq_spin = QSpinBox()
+        self.label_freq_spin = QSlider(Qt.Orientation.Horizontal)
         self.label_freq_spin.setRange(5, 500)
         self.label_freq_spin.setValue(40)
         self.label_freq_spin.valueChanged.connect(self.apply_style)
         label_freq_row = QHBoxLayout()
-        label_freq_row.addWidget(QLabel("Частота (точек):"))
+        label_freq_row.addWidget(QLabel("Частота подписей:"))
         label_freq_row.addWidget(self.label_freq_spin)
         self.label_nobg_check = QCheckBox("Только цифры, без фона")
         self.label_nobg_check.setChecked(False)
@@ -2569,8 +3338,6 @@ class IsobathsTab(QWidget):
         label_layout.addWidget(self.show_labels_check)
         label_layout.addLayout(label_size_row)
         label_layout.addLayout(label_freq_row)
-        label_layout.addWidget(QLabel("Подписи диапазонов глубин внутри заливки —\n"
-                                       "тем же шрифтом, в центре каждой области."))
         label_layout.addWidget(self.label_nobg_check)
         label_group.setLayout(label_layout)
 
@@ -2587,8 +3354,12 @@ class IsobathsTab(QWidget):
         fill_opacity_row.addWidget(QLabel("Прозрачность:"))
         fill_opacity_row.addWidget(self.fill_opacity_spin)
         self.fill_steps_spin = QSpinBox()
-        self.fill_steps_spin.setRange(2, 30)
+        self.fill_steps_spin.setRange(0, 30)
         self.fill_steps_spin.setValue(8)
+        self.fill_steps_spin.setToolTip(
+            "Число ступеней перехода цвета заливки от минимальной глубины к "
+            "максимальной. 0 — перехода нет, вся заливка одним цветом. "
+            "10 — плавный переход в 10 цветов.")
         fill_steps_row = QHBoxLayout()
         fill_steps_row.addWidget(QLabel("Ступеней:"))
         fill_steps_row.addWidget(self.fill_steps_spin)
@@ -2603,10 +3374,8 @@ class IsobathsTab(QWidget):
         settings_layout.addLayout(interval_row)
         settings_layout.addLayout(cell_row)
         settings_layout.addLayout(smooth_row)
-        settings_layout.addLayout(load_waterline_row)
-        settings_layout.addWidget(self.draw_btn)
-        settings_layout.addWidget(clear_waterline_btn)
-        settings_layout.addWidget(self.waterline_label)
+        settings_layout.addWidget(points_group)
+        settings_layout.addWidget(waterline_group)
         settings_layout.addWidget(line_group)
         settings_layout.addWidget(label_group)
         settings_layout.addWidget(fill_group)
@@ -2615,9 +3384,43 @@ class IsobathsTab(QWidget):
         settings_widget.setLayout(settings_layout)
         settings_widget.setFixedWidth(240)
 
+        self.view_3d = new_map_view()
+        load_html(self.view_3d, build_terrain_html(dict(nx=0, ny=0, x0=0, y0=0, cellX=1, cellY=1,
+                                                          z=[], zmin=0, zmax=1)), "terrain3d")
+        self.map_stack = QStackedWidget()
+        self.map_stack.addWidget(self.map_view)
+        self.map_stack.addWidget(self.view_3d)
+
+        self.view2d_btn = QPushButton("Карта")
+        self.view2d_btn.setCheckable(True)
+        self.view2d_btn.setChecked(True)
+        self.view2d_btn.toggled.connect(self.on_view2d_toggled)
+        self.view3d_btn = QPushButton("3D дно")
+        self.view3d_btn.setCheckable(True)
+        self.view3d_btn.toggled.connect(self.on_view3d_toggled)
+        self.exaggeration_spin = QDoubleSpinBox()
+        self.exaggeration_spin.setRange(1.0, 30.0)
+        self.exaggeration_spin.setValue(3.0)
+        self.exaggeration_spin.setSuffix("×")
+        self.exaggeration_spin.setToolTip("Вертикальное преувеличение рельефа дна в 3D — "
+                                           "глубина обычно мала по сравнению с площадью акватории, "
+                                           "без преувеличения рельеф почти не виден.")
+        self.exaggeration_spin.valueChanged.connect(self.on_exaggeration_changed)
+        view_row = QHBoxLayout()
+        view_row.addWidget(self.view2d_btn)
+        view_row.addWidget(self.view3d_btn)
+        view_row.addSpacing(12)
+        view_row.addWidget(QLabel("Преувеличение рельефа:"))
+        view_row.addWidget(self.exaggeration_spin)
+        view_row.addStretch(1)
+
+        map_col = QVBoxLayout()
+        map_col.addLayout(view_row)
+        map_col.addWidget(self.map_stack, 1)
+
         content_row = QHBoxLayout()
         content_row.addWidget(settings_widget)
-        content_row.addWidget(self.map_view, 1)
+        content_row.addLayout(map_col, 1)
 
         self.status_label = QLabel("")
 
@@ -2660,44 +3463,102 @@ class IsobathsTab(QWidget):
         поверх новой карты, пока не нажать «Построить» заново (как и раньше
         было при повторном открытии диалога)."""
         points = self.main_window.points or {}
+        lat = points.get("lat", [])
+        if len(lat) != getattr(self, "_last_points_len", None):
+            # Число точек изменилось — скорее всего, загружена другая запись:
+            # старые индексы исключённых точек больше ничего не значат.
+            self.excluded_indices = set()
+            self.points_label.setText("Исключено точек: 0")
+        self._last_points_len = len(lat)
         html = build_isobaths_map_html(self.main_window.basemap_combo.currentText(),
-                                        points.get("lat", []), points.get("lon", []))
+                                        lat, points.get("lon", []),
+                                        excluded_indices=self.excluded_indices)
         load_html(self.map_view, html, "isobaths")
 
     def on_draw_toggled(self, checked):
-        self.draw_btn.setText("Рисование уреза: кликните по карте (ещё раз — выкл)"
-                               if checked else "Нарисовать урез воды")
+        if checked:
+            self.draw_channel_btn.setChecked(False)
+            self.clean_btn.setChecked(False)
+        self.draw_btn.setText("Клик по\nкарте…" if checked else "Нарисовать\nурез")
         self.map_view.page().runJavaScript(f"setDrawMode({'true' if checked else 'false'});")
 
-    def on_map_clicked(self, lat, lon):
-        if not self.draw_btn.isChecked():
-            return
-        self.waterline_points.append((lat, lon))
-        self.waterline_label.setText(f"Точек уреза: {len(self.waterline_points)}")
+    def on_draw_channel_toggled(self, checked):
+        if checked:
+            self.draw_btn.setChecked(False)
+            self.clean_btn.setChecked(False)
+        self.draw_channel_btn.setText("Клик по\nкарте…" if checked else "Нарисовать\nрусло")
+        self.map_view.page().runJavaScript(f"setDrawChannelMode({'true' if checked else 'false'});")
 
-    def clear_waterline(self):
-        self.waterline_points = []
-        self.waterline_label.setText("Точек уреза: 0")
-        self.map_view.page().runJavaScript("clearWaterline();")
+    def on_clean_toggled(self, checked):
+        if checked:
+            self.draw_btn.setChecked(False)
+            self.draw_channel_btn.setChecked(False)
+        self.clean_btn.setText("Клик по\nкарте…" if checked else "Удалить точки")
+        self.map_view.page().runJavaScript(f"setCleanMode({'true' if checked else 'false'});")
+
+    def on_point_toggled(self, index):
+        if index in self.excluded_indices:
+            self.excluded_indices.discard(index)
+        else:
+            self.excluded_indices.add(index)
+        self.points_label.setText(f"Исключено точек: {len(self.excluded_indices)}")
+
+    def restore_all_points(self):
+        self.excluded_indices = set()
+        self.points_label.setText("Исключено точек: 0")
+        self.map_view.page().runJavaScript("restoreAllPoints();")
+
+    def on_lines_changed(self, payload):
+        self.waterline_lines = [[(p[0], p[1]) for p in line] for line in payload.get("waterline", [])]
+        self.channel_lines = [[(p[0], p[1]) for p in line] for line in payload.get("channel", [])]
+
+    def on_hide_waterline_toggled(self, checked):
+        self.map_view.page().runJavaScript(f"setWaterlineVisible({'false' if checked else 'true'});")
+
+    def on_corner_smooth_toggled(self, checked):
+        self.map_view.page().runJavaScript(f"setSmoothPreview({'true' if checked else 'false'});")
 
     def on_hide_track_toggled(self, checked):
         self.hide_track_btn.setText("Показать трек" if checked else "Скрыть трек")
         self.map_view.page().runJavaScript(f"setTrackVisible({'false' if checked else 'true'});")
 
+    def on_view2d_toggled(self, checked):
+        if checked:
+            self.view3d_btn.setChecked(False)
+            self.map_stack.setCurrentWidget(self.map_view)
+        elif not self.view3d_btn.isChecked():
+            self.view2d_btn.setChecked(True)
+
+    def on_view3d_toggled(self, checked):
+        if checked:
+            self.view2d_btn.setChecked(False)
+            self.map_stack.setCurrentWidget(self.view_3d)
+        elif not self.view2d_btn.isChecked():
+            self.view3d_btn.setChecked(True)
+
+    def on_exaggeration_changed(self, value):
+        self.view_3d.page().runJavaScript(f"setExaggeration({value});")
+
     def load_waterline_from_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Загрузить урез воды", "",
-                                               "Текст/CSV (*.csv *.txt);;Все файлы (*)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Загрузить урез воды", "",
+            "Текст/CSV/KML (*.csv *.txt *.kml);;Все файлы (*)")
         if not path:
             return
         try:
-            points = read_waterline_points(path)
+            if path.lower().endswith(".kml"):
+                urez_lines, channel_lines = read_waterline_kml(path)
+            else:
+                urez_lines, channel_lines = [read_waterline_points(path)], []
         except (ValueError, OSError) as e:
             QMessageBox.warning(self, "Урез воды", f"Не удалось прочитать файл:\n{e}")
             return
-        self.waterline_points.extend(points)
-        self.waterline_label.setText(f"Точек уреза: {len(self.waterline_points)}")
-        points_js = json.dumps([[lat, lon] for lat, lon in self.waterline_points])
-        self.map_view.page().runJavaScript(f"setWaterline({points_js});")
+        self.waterline_lines.extend(urez_lines)
+        self.channel_lines.extend(channel_lines)
+        payload = json.dumps(dict(
+            waterline=[[[lat, lon] for lat, lon in line] for line in urez_lines],
+            channel=[[[lat, lon] for lat, lon in line] for line in channel_lines]))
+        self.map_view.page().runJavaScript(f"addLines({payload});")
 
     def _update_line_color_btn(self):
         self.line_color_btn.setStyleSheet(f"background-color: {self.line_color.name()};")
@@ -2736,14 +3597,25 @@ class IsobathsTab(QWidget):
     def build_isobaths(self):
         points = self.main_window.points or {}
         lat, lon, depth = points.get("lat", []), points.get("lon", []), points.get("value", [])
+        if self.excluded_indices:
+            keep = [i for i in range(len(lat)) if i not in self.excluded_indices]
+            lat = [lat[i] for i in keep]
+            lon = [lon[i] for i in keep]
+            depth = [depth[i] for i in keep]
         if len(lat) < 10:
             QMessageBox.information(self, "Изобаты",
                                      "Недостаточно точек — сначала загрузите эхограмму.")
             return
+        waterline_lines = [list(line) for line in self.waterline_lines]
+        channel_lines = [list(line) for line in self.channel_lines]
+        if self.corner_smooth_check.isChecked():
+            waterline_lines = [smooth_polyline_corners(line) for line in waterline_lines]
+            channel_lines = [smooth_polyline_corners(line) for line in channel_lines]
         self.status_label.setText("Строю изобаты…")
-        run_async(lambda: compute_isobaths(lat, lon, depth, list(self.waterline_points),
+        run_async(lambda: compute_isobaths(lat, lon, depth, waterline_lines,
                                             self.cell_spin.value(), self.interval_spin.value(),
-                                            self.fill_steps_spin.value(), self.smooth_spin.value()),
+                                            self.fill_steps_spin.value(), self.smooth_spin.value(),
+                                            channel_lines=channel_lines),
                   on_finished=self.on_built, on_error=self.on_build_error)
 
     def on_built(self, result):
@@ -2754,6 +3626,17 @@ class IsobathsTab(QWidget):
         self.on_show_lines_toggled(self.show_lines_check.isChecked())
         self.on_show_fill_toggled(self.show_fill_check.isChecked())
         self.on_show_labels_toggled(self.show_labels_check.isChecked())
+        self.rebuild_3d_view()
+
+    def rebuild_3d_view(self):
+        terrain = (self.last_result or {}).get("terrain")
+        if not terrain:
+            return
+        html = build_terrain_html(terrain)
+        load_html(self.view_3d, html, "terrain3d")
+        # Свежая страница — свой JS-контекст со значением по умолчанию (3×),
+        # применяем текущее выбранное преувеличение сразу после загрузки.
+        QTimer.singleShot(400, lambda: self.on_exaggeration_changed(self.exaggeration_spin.value()))
 
     def delete_isobaths(self):
         self.last_result = None
@@ -3205,7 +4088,7 @@ class PPKTab(QWidget):
         self.details_view.setPlaceholderText(
             "Выберите пару в списке слева, чтобы увидеть подробности RINEX "
             "(системы, спутники, координаты приёмника и т.д.).")
-        use_track_btn = QPushButton("Использовать выбранный результат как GNSS-трек")
+        use_track_btn = QPushButton("Использовать выбранный результат как ровер")
         use_track_btn.clicked.connect(self.use_selected_as_track)
         self.map_view = new_map_view()
         self.map_view.setMinimumHeight(220)
@@ -3906,13 +4789,13 @@ HELP_HTML = """
 <h2>Шапка окна</h2>
 <p>Общие для всех вкладок поля вверху:</p>
 <ul>
-<li><b>Файл эхограммы (.sl2)</b> — запись эхолота Lowrance. Кнопка
+<li><b>Эхограмма</b> — запись эхолота Lowrance (.sl2). Кнопка
 «Мультиэхограмма» загружает несколько файлов одного выхода подряд и
 объединяет их на одной карте.</li>
-<li><b>GNSS-трек</b> — точный трек (NMEA-лог, RTKLIB .pos, CSV или UBX) для
+<li><b>Ровер</b> — точный GNSS-трек (NMEA-лог, RTKLIB .pos, CSV или UBX) для
 расчёта смещения; это же поле служит ровером для вкладки «PPK». Файл .ubx,
 выбранный здесь, автоматически добавляется и в список роверов PPK.</li>
-<li><b>GNSS база</b> — файл базовой (стационарной) станции, нужен только для
+<li><b>База</b> — файл базовой (стационарной) станции, нужен только для
 PPK; автоматически добавляется в список баз PPK.</li>
 </ul>
 <p>Диалоги выбора файлов запоминают последнюю открытую папку. Рядом с полями
@@ -3928,14 +4811,18 @@ PPK; автоматически добавляется в список баз PP
 
 <h2>Эхограмма</h2>
 <p>Водопад сонара выбранного файла эхограммы (столбец — пинг, строка —
-глубина), с линейкой глубин слева и осью времени/расстояния снизу.</p>
+глубина), с линейкой глубин слева и осью времени/расстояния снизу. Таймлайн
+профиля глубины под эхограммой размечен так же, как таймлайн на «Карте»
+(линии сетки и подписи времени/расстояния); колесо мыши над ним меняет
+масштаб эхограммы — как и колесо над самим изображением.</p>
 <ul>
-<li><b>Режим меток</b> — включите и кликните по эхограмме, чтобы поставить
-метку с текстом в этом месте; список меток и текст — справа, можно
-редактировать и удалять.</li>
+<li><b>Режим заметок</b> — включите и кликните по эхограмме, чтобы поставить
+заметку с текстом в этом месте; список заметок и текст — справа, можно
+редактировать и удалять. Под ними — мини-карта с треком: при наведении на
+эхограмму на ней показывается жёлтой точкой соответствующее место на воде.</li>
 <li><b>Линейка</b> — включите и кликните по двум точкам: покажет расстояние
 между ними и по глубине, и по времени/дистанции одновременно.</li>
-<li><b>Сохранить пометки / Загрузить пометки</b> — в отдельный JSON-файл рядом
+<li><b>Сохранить заметки / Загрузить заметки</b> — в отдельный JSON-файл рядом
 с эхограммой.</li>
 </ul>
 
@@ -3957,8 +4844,8 @@ PPK; автоматически добавляется в список баз PP
 <li>Результат — список пар со статистикой (fix/float/single %), мини-карта
 (трек ровера и флажок базы) и подробности по каждому RINEX-файлу пары
 (период, системы и спутники, координаты приёмника и т.д.).</li>
-<li>«Использовать выбранный результат как GNSS-трек» подставляет .pos
-выбранной пары в поле «GNSS-трек» шапки окна.</li>
+<li>«Использовать выбранный результат как ровер» подставляет .pos
+выбранной пары в поле «Ровер» шапки окна.</li>
 </ul>
 <p>Путь к папке RTKLIB (convbin/rnx2rtkp) задаётся один раз в «Настройках».</p>
 
@@ -3972,11 +4859,31 @@ PPK; автоматически добавляется в список баз PP
 
 <h2>Построение изобат</h2>
 <p>Строит линии постоянной глубины и заливку по точкам трека
-(интерполяция + контуры). Можно нарисовать урез воды кликами по карте или
-загрузить из файла — это заметно улучшает интерполяцию у берега, так как
-сонар не измеряет вплотную к берегу. Настраиваются шаг изобат, ячейка сетки,
-сглаживание, цвет/толщина линий, подписи и заливка (прозрачность, число
-ступеней). Карта на этой вкладке обновляется при каждом переходе на неё.</p>
+(интерполяция + контуры). Карта на этой вкладке обновляется при каждом
+переходе на неё; переключатель «Карта» / «3D дно» над ней показывает вместо
+2D-контуров тот же грид как трёхмерную поверхность (ЛКМ — вращение, колесо —
+зум, ПКМ — сдвиг; ползунок «Преувеличение рельефа» меняет вертикальный
+масштаб мгновенно).</p>
+<ul>
+<li><b>Точки</b> — ручная чистка выбросов промера: «Удалить точки» включает
+режим, клик по точке трека на карте исключает её из расчёта (клик ещё раз —
+вернуть); «Восстановить все» возвращает все точки разом.</li>
+<li><b>Урез</b> — линии уреза воды (граница вода/суша, глубина всегда 0 м) и
+линии русла (продолжение интерполяции от ближайших промеров, без выдумывания
+глубины). Линий каждого типа может быть несколько. «Загрузить урез» — CSV/
+текст (всегда урез) или KML (цвет линии определяет тип: оранжевая/красная —
+урез, голубая/синяя — русло). «Нарисовать урез» / «Нарисовать русло» — клик
+по карте добавляет точку (концы линий притягиваются друг к другу), ПКМ
+завершает линию или удаляет линию под курсором, Ctrl+клик вставляет точку в
+линию, Shift+клик удаляет ближайшую точку. Чекбокс «Сглаживание» сглаживает
+острые углы нарисованных линий (видно сразу на карте); «Скрыть» прячет линии,
+не удаляя точки. Изобаты доходят до нарисованных линий, даже если урез —
+открытая линия или короткий фрагмент, включая заливы, куда лодка не
+подходила вплотную к берегу.</li>
+<li>Настраиваются шаг изобат, ячейка сетки, сглаживание грида, цвет/толщина
+линий, подписи (размер и частота) и заливка (прозрачность, число ступеней
+перехода цвета — 0 значит один цвет без переходов).</li>
+</ul>
 
 <h2>Донные отложения</h2>
 <p>Экспериментальная аналитика по индексу твёрдости дна (резкость эхосигнала
@@ -4544,7 +5451,7 @@ class MainWindow(QMainWindow):
         close_echograms_btn = QPushButton("Закрыть эхограммы")
         close_echograms_btn.clicked.connect(self.close_echograms)
         row1 = QHBoxLayout()
-        row1.addWidget(QLabel("Файл эхограммы (.sl2):"))
+        row1.addWidget(QLabel("Эхограмма:"))
         row1.addWidget(help_icon(SL2_FILE_HELP))
         row1.addWidget(self.sl2_edit, 1)
         row1.addWidget(sl2_btn)
@@ -4569,7 +5476,7 @@ class MainWindow(QMainWindow):
         close_gnss_btn = QPushButton("Закрыть")
         close_gnss_btn.clicked.connect(self.close_gnss)
         row2 = QHBoxLayout()
-        row2.addWidget(QLabel("GNSS-трек:"))
+        row2.addWidget(QLabel("Ровер:"))
         row2.addWidget(help_icon(GNSS_FILE_HELP))
         row2.addWidget(self.gnss_edit, 1)
         row2.addWidget(gnss_btn)
@@ -4585,7 +5492,7 @@ class MainWindow(QMainWindow):
         close_gnss_base_btn = QPushButton("Закрыть")
         close_gnss_base_btn.clicked.connect(self.close_gnss_base)
         row2b = QHBoxLayout()
-        row2b.addWidget(QLabel("GNSS база:"))
+        row2b.addWidget(QLabel("База:"))
         row2b.addWidget(help_icon(GNSS_BASE_FILE_HELP))
         row2b.addWidget(self.gnss_base_edit, 1)
         row2b.addWidget(gnss_base_btn)
@@ -4804,7 +5711,7 @@ class MainWindow(QMainWindow):
 
     def pick_gnss(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "GNSS-трек", self.last_dir(), "GNSS-трек (*.nmea *.pos *.csv *.ubx);;Все файлы (*)")
+            self, "Ровер", self.last_dir(), "GNSS-трек (*.nmea *.pos *.csv *.ubx);;Все файлы (*)")
         if path:
             self.remember_dir(path)
             self.gnss_paths = [path]
@@ -4820,7 +5727,7 @@ class MainWindow(QMainWindow):
 
     def _pick_next_gnss_file(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "GNSS-трек", self.last_dir(), "GNSS-трек (*.nmea *.pos *.csv *.ubx);;Все файлы (*)")
+            self, "Ровер", self.last_dir(), "GNSS-трек (*.nmea *.pos *.csv *.ubx);;Все файлы (*)")
         if not path:
             return
         self.remember_dir(path)

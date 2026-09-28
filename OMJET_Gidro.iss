@@ -5,7 +5,7 @@
 ; Готовый установщик появится в installer_dist/OMJET_Gidro_Setup_<версия>.exe
 
 #define MyAppName "ОМДЖЕТ Гидро"
-#define MyAppVersion "0.1.5"
+#define MyAppVersion "0.1.6"
 #define MyAppPublisher "andrewkena"
 #define MyAppURL "https://github.com/andrewkena/omjet-gidro"
 #define MyAppExeName "OMJET_Gidro.exe"
